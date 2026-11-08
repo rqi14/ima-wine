@@ -95,13 +95,21 @@ def _cache_path(title):
     return os.path.join(DOWNLOADS, '.text', title + '.json')
 
 
+def _cached(title):
+    """Cache file for a title given exactly or as a unique prefix (tools accept prefixes)."""
+    d = os.path.dirname(_cache_path('x'))
+    names = [n for n in (os.listdir(d) if os.path.isdir(d) else []) if n.endswith('.json')]
+    exact = [n for n in names if n[:-5] in (title, title + '.pdf')]
+    hits = exact or [n for n in names if n.startswith(title)]
+    return os.path.join(d, hits[0]) if len(hits) == 1 else None
+
+
 def _load(kb, title, folders):
     """Page texts for a document, from the cache or by fetching it through the client once."""
-    for name in (title, title + '.pdf'):
-        p = _cache_path(name)
-        if os.path.exists(p):
-            with open(p, encoding='utf-8') as f:
-                return json.load(f)
+    p = _cached(title)
+    if p:
+        with open(p, encoding='utf-8') as f:
+            return json.load(f)
     doc = ima.get_document(kb, title, folders or [])
     os.makedirs(os.path.dirname(_cache_path(doc['title'])), exist_ok=True)
     with open(_cache_path(doc['title']), 'w', encoding='utf-8') as f:
@@ -141,9 +149,8 @@ async def ima_render_pages(title: str, pages: str):
     """Pages of a previously fetched document as images (for garbled_pages, scans, charts).
     At most 6 pages per call."""
     def go():
-        p = _cache_path(title)
-        p = p if os.path.exists(p) else _cache_path(title + '.pdf')
-        if not os.path.exists(p):
+        p = _cached(title)
+        if not p:
             return 'ERROR: fetch it with ima_get_document first'
         with open(p, encoding='utf-8') as f:
             doc = json.load(f)

@@ -102,6 +102,16 @@ def _js(t, body):
     return t.js('(() => {' + JS_HELPERS + body + '})()')
 
 
+def _js_until(t, body, ok, timeout=20):
+    """Lists render their rows before their text (first load after login took >3s): poll."""
+    end = time.time() + timeout
+    while True:
+        v = _js(t, body)
+        if ok(v) or time.time() >= end:
+            return v
+        time.sleep(1)
+
+
 # ---------- session ----------
 def status():
     ts = targets()
@@ -168,24 +178,48 @@ def kb_page():
 
 
 def list_kbs():
-    return _js(kb_page(), 'return kbs().map(k => k.name)')
+    return _js_until(kb_page(), 'return kbs().map(k => k.name)', lambda v: v and all(v))
+
+
+SNAPSHOT = 'return JSON.stringify([crumbs(), items().slice(0, 5).map(i => i.title)])'
+
+
+def _await_change(t, before, timeout=4):
+    """After a click the old rows stay on screen for a moment: reading them then would list the
+    previous folder. Wait until the view differs from what it was before the click.
+    ponytail: no change within 4s = we clicked where we already were (new rows took <2s in
+    tests); the sidebar has no selected-state marker to check instead."""
+    end = time.time() + timeout
+    while time.time() < end:
+        time.sleep(0.5)
+        now = _js(t, SNAPSHOT)
+        if now != before and json.loads(now)[1]:
+            return
+    # same content is possible (clicked the folder already shown); fall through
 
 
 def open_kb(name):
-    r = _js(kb_page(), f'const k = pick(kbs(), "name", {json.dumps(name)}); if (!k) return null; k.el.click(); return k.name')
+    t = kb_page()
+    list_kbs()
+    before = _js(t, SNAPSHOT)
+    r = _js(t, f'const k = pick(kbs(), "name", {json.dumps(name)}); if (!k) return null; k.el.click(); return k.name')
     if not r:
         raise ImaError(f'no knowledge base matching {name!r}; have: {list_kbs()}')
-    time.sleep(2)
+    _await_change(t, before)
     return r
 
 
 def ls():
-    r = _js(kb_page(), 'return {path: crumbs(), items: items().map(i => ({type: i.folder ? "folder" : "document", title: i.title, meta: i.meta}))}')
+    # an empty folder just waits out the timeout
+    r = _js_until(kb_page(), 'return {path: crumbs(), items: items().map(i => ({type: i.folder ? "folder" : "document", title: i.title, meta: i.meta}))}',
+                  lambda v: v['items'] and all(i['title'] for i in v['items']), timeout=10)
     return {'path': [p for p in r['path'] if p], 'items': r['items']}
 
 
 def cd(name):
     t = kb_page()
+    ls()  # wait for the rows to render
+    before = _js(t, SNAPSHOT)
     if name == '..':
         r = _js(t, 'const c = $$("nav.ant-breadcrumb li"); if (c.length < 2) return null; '
                    'const l = c[c.length-2].querySelector("a,span"); l.click(); return txt(l)')
@@ -194,7 +228,7 @@ def cd(name):
                    'if (!i) return null; i.el.click(); return i.title')
     if not r:
         raise ImaError(f'no folder {name!r} here; items: {[i["title"] for i in ls()["items"]]}')
-    time.sleep(2)
+    _await_change(t, before)
     return r
 
 
@@ -217,6 +251,7 @@ def _viewer(wait):
 
 
 def open_doc(title):
+    ls()  # wait for the rows to render
     before = {x['id'] for x in targets()}
     r = _js(kb_page(), f'const i = pick(items().filter(x => !x.folder), "title", {json.dumps(title)}); '
                        'if (!i) return null; i.el.click(); return i.title')
