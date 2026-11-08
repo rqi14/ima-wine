@@ -31,6 +31,9 @@ RUN gcc -shared -fPIC -O2 -o /opt/wine/lib/ksm_preload.so /tmp/ksm_preload.c
 
 # ---------- 2. runtime ----------
 FROM debian:${DEBIAN}
+LABEL org.opencontainers.image.source=https://github.com/rqi14/ima-wine \
+      org.opencontainers.image.description="Tencent ima.copilot under a memory-patched Wine, with an MCP server for agents" \
+      org.opencontainers.image.licenses=LGPL-2.1-or-later
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       libx11-6 libxext6 libxrender1 libxrandr2 libxi6 libxcursor1 libxcomposite1 libxfixes3 \
