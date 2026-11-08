@@ -173,7 +173,8 @@ def kb_page():
         t, _ = page(KB_PAGE, wait=15)
         if not t:
             raise ImaError('could not open the knowledge base view (logged in?)')
-        time.sleep(3)  # the sidebar renders after the first API round trip
+        # let the default (personal) KB finish loading: a click during that load gets lost
+        _await_view(t, lambda v: bool(v['title']), 'knowledge base view', timeout=30)
     return t
 
 
@@ -218,11 +219,17 @@ def open_kb(name):
     t = kb_page()
     list_kbs()
     before = _js(t, SNAPSHOT)
-    r = _js(t, f'const k = pick(kbs(), "name", {json.dumps(name)}); if (!k) return null; k.el.click(); return k.name')
-    if not r:
-        raise ImaError(f'no knowledge base matching {name!r}; have: {list_kbs()}')
-    # the page title is the open knowledge base's full name
-    _await_view(t, lambda v: v['title'] == r, f'knowledge base {r!r}')
+    click = f'const k = pick(kbs(), "name", {json.dumps(name)}); if (!k) return null; k.el.click(); return k.name'
+    for attempt in range(3):
+        r = _js(t, click)
+        if not r:
+            raise ImaError(f'no knowledge base matching {name!r}; have: {list_kbs()}')
+        try:  # the page title is the open knowledge base's full name
+            _await_view(t, lambda v: v['title'] == r, f'knowledge base {r!r}', timeout=8)
+            break
+        except ImaError:
+            if attempt == 2:
+                raise
     _await_change(t, before)  # clicking the open KB resets it to its root: let that land
     return r
 
