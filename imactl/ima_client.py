@@ -198,6 +198,22 @@ def _await_change(t, before, timeout=4):
     # same content is possible (clicked the folder already shown); fall through
 
 
+def _await_view(t, ok, what, timeout=20):
+    """Wait until the view is the one we asked for, judged by identity rather than by 'something
+    changed': on the first load the default (personal) knowledge base renders late, after our
+    click, and change-detection then happily returned the personal KB's rows."""
+    end = time.time() + timeout
+    while True:
+        v = _js(t, 'return {title: document.title, crumbs: crumbs(), n: items().length}')
+        if ok(v) and v['n']:
+            return
+        if time.time() >= end:
+            if ok(v):
+                return  # the right view, just empty
+            raise ImaError(f'{what} did not open within {timeout}s')
+        time.sleep(0.5)
+
+
 def open_kb(name):
     t = kb_page()
     list_kbs()
@@ -205,7 +221,9 @@ def open_kb(name):
     r = _js(t, f'const k = pick(kbs(), "name", {json.dumps(name)}); if (!k) return null; k.el.click(); return k.name')
     if not r:
         raise ImaError(f'no knowledge base matching {name!r}; have: {list_kbs()}')
-    _await_change(t, before)
+    # the page title is the open knowledge base's full name
+    _await_view(t, lambda v: v['title'] == r, f'knowledge base {r!r}')
+    _await_change(t, before)  # clicking the open KB resets it to its root: let that land
     return r
 
 
@@ -228,7 +246,10 @@ def cd(name):
                    'if (!i) return null; i.el.click(); return i.title')
     if not r:
         raise ImaError(f'no folder {name!r} here; items: {[i["title"] for i in ls()["items"]]}')
-    _await_change(t, before)
+    if name == '..':
+        _await_change(t, before)
+    else:  # the breadcrumb's last entry is the open folder
+        _await_view(t, lambda v: v['crumbs'] and v['crumbs'][-1] == r, f'folder {r!r}')
     return r
 
 

@@ -65,7 +65,8 @@ fi
 socat TCP-LISTEN:9223,fork,reuseaddr TCP:127.0.0.1:9222 &
 
 # ---- 4b. MCP server for agents (talks to CDP on 9222 locally) ----
-( cd /opt/imactl && while :; do venv/bin/python server.py >>/tmp/mcp.log 2>&1; sleep 3; done ) &
+# `|| true`: the subshell inherits set -e, and a non-zero exit (SIGTERM) used to end the loop for good
+( cd /opt/imactl && while :; do venv/bin/python server.py >>/tmp/mcp.log 2>&1 || true; sleep 3; done ) &
 
 # ---- 5. ima ----
 FLAGS=(
