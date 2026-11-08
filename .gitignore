@@ -1,0 +1,4 @@
+ima-data/
+*.png
+*.pdf
+__pycache__/

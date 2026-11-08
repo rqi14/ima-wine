@@ -1,0 +1,17 @@
+# wine shell32: copy_engine_move released *dest_folder (still NULL) when MoveFileExW failed,
+# so any failed IFileOperation move crashed the caller. ima uses IFileOperation to move a
+# finished download into place; a failed rename took the whole client down.
+# Ours, not upstream yet. LGPL-2.1-or-later.
+diff --git a/dlls/shell32/shlfileop.c b/dlls/shell32/shlfileop.c
+index 16074d5..da68d41 100644
+--- a/dlls/shell32/shlfileop.c
++++ b/dlls/shell32/shlfileop.c
+@@ -1962,7 +1962,7 @@ static HRESULT copy_engine_move(struct file_operation *operation, struct copy_en
+                 return hr;
+             return COPYENGINE_S_DONT_PROCESS_CHILDREN;
+         }
+-        IShellItem_Release(*dest_folder);
++        /* *dest_folder is still NULL here: releasing it crashed every failed move */
+         return HRESULT_FROM_WIN32(GetLastError());
+     }
+ 
