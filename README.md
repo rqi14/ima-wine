@@ -25,6 +25,7 @@ ima 网页版打开**订阅知识库**里的 PDF 会提示「版本过低」。�
 | `imactl/ima_client.py` | 核心：经 CDP 像用户一样操作客户端，取全文 |
 | `imactl/server.py` | MCP 服务（streamable HTTP，`:8765/mcp`），给其他容器里的 agent 用 |
 | `imactl/imactl.py` | 调试用 CLI |
+| `imactl/cidmaps/` + `tools/build_cidmaps.py` | 思源字体 CID → Unicode 表，修复坏文字层用（见「已知问题」） |
 
 ## 内存
 
@@ -77,9 +78,14 @@ services:
     shm_size: 512m
     stop_grace_period: 40s        # 让 ima 来得及把轮换后的登录令牌写盘
     ports: ["127.0.0.1:8765:8765"]   # MCP；调试 CDP 再加 9223
+    environment:
+      IMA_DOWNLOADS_PUBLIC: /opt/data/ima-downloads   # agent 容器里看到的下载目录，写进返回的 file 路径
     volumes:
-      - ./ima-data:/data          # Wine 前缀、ima 本体、登录状态、下载
+      - ./ima-data:/data          # Wine 前缀、ima 本体、登录状态
+      - ./agent-data/ima-downloads:/data/downloads    # 下载的原件；agent 那边挂同一个目录
 ```
+
+原件直接共享给 agent：它要查表格、看图、用自己的工具时打开文件即可；`ima_get_document` 的文字只是省事的那一层。
 
 - 首次启动会下载 ~220 MB 的官方安装包并初始化 Wine 前缀，约 1–2 分钟。
 - 换 ima 版本：设 `IMA_URL` 和 `IMA_MD5`（地址可在 ima 自己更新器的日志里找到）。
@@ -114,7 +120,7 @@ mcp_servers:
 | `ima_list_knowledge_bases` | 全部知识库：个人、共享、订阅 |
 | `ima_search(kb, query)` | 库内全文检索（客户端自带搜索，订阅库 / 共享库也行），返回标题与片段 |
 | `ima_list(kb, folders)` | 某库 / 某文件夹下的条目 |
-| `ima_get_document(kb, title, folders, pages, max_chars)` | **全文**，按页分隔；不给 `folders` 就用库内搜索定位；乱码页自动 OCR；超长时告诉从哪页接着要 |
+| `ima_get_document(kb, title, folders, pages, max_chars)` | **全文**，按页分隔，外加 agent 可直接打开的 PDF 路径；不给 `folders` 就用库内搜索定位；超长时告诉从哪页接着要 |
 | `ima_render_pages(title, pages)` | 指定页的图片（乱码页、扫描件、图表） |
 | `ima_screenshot` | 整个屏幕，排错用 |
 
@@ -128,9 +134,23 @@ mcp_servers:
 
 ## 已知问题
 
-- 有的 PDF（Aspose 生成的居多）内嵌子集字体的 ToUnicode 是坏的，抽出来是同一个字重复（「机机机机」）；
-  删掉 ToUnicode 也救不回来，子集字体里没有可用的 cmap。这类页自动用 Tesseract（chi_sim+eng，300 dpi）OCR，
-  标 `[OCR]`：正文基本可读，但会漏浅色标题、多栏会串行、被水印压住的字会错。图表和幻灯片仍建议 `ima_render_pages` 看图。
+PDF 文字层的两类毛病，处理方式不同：
+
+- **思源黑体 / 宋体子集，ToUnicode 坏了或缺了**（中文研报很常见）：抽出来是生僻字（「⹨俚յ䠋」）或干脆丢字。
+  子集保留了原始 CID，而完整思源字体有 CID → Unicode 的对应，所以能**精确**修好。CID 编号随版本变，
+  连小版本也变（宋体 1.000 → 1.001 把「持」从 19302 挪到 19301），所以 `tools/build_cidmaps.py` 从 Adobe
+  每个发布版本（黑体 1.001–2.005、宋体 1.000–2.003，CN 区域子集与 SC 泛 CJK 各一）生成表，
+  并顺着 GSUB 替换把异体字形也映射上，去重后 24 张、5.3 MB。下载后逐个字体用每张表解码，
+  取解码成常用字（GB2312/Big5）最多、且占比 ≥ 85% 的那张（选对版本 98–99%，选错 ~27%）重写 ToUnicode，
+  **直接修 PDF 文件本身**（画面不变），共享给 agent 的就是修好的文件。PDF 原有映射与表一致时不动；
+  表里没有的字形写成 U+FFFD，明确表示「未知」，不沿用已证明是错的旧映射。实测一份 35 页、18 个子集字体的报告全部还原。
+- **Aspose 由 Office 转出的 PDF，同一个字重复（「机机机机」）**：每段正文都被**栅格化成图片**
+  （一块 2×2 的纯色图配一张文字形状的透明遮罩），上面叠一层看不见的 0 号字形，坏 ToUnicode 把它映射成一个字。
+  文件里没有这些字。能精确拿回的只有结构树里的 `/Alt`、`/ActualText`（生成器为无障碍写的，图表常有整段原文），
+  会附在该页输出里；其余列在 `image_only_pages`，交给 agent 看图。
+  试过 Tesseract 整页 OCR：漏标题、多栏串行、水印处错字，不值它的体积，已去掉。
+
+依赖只加了纯 Python 的 pypdf 和 fontTools（pikepdf 会带进 lxml、Pillow，多 ~40 MB）。
 - 客户端不给「下载」的文档走阅读器文字层兜底，这条路径还没遇到真实样本。
 
 ## 版权

@@ -15,7 +15,14 @@ from mcp.server.fastmcp import FastMCP, Image
 import ima_client as ima
 
 DOWNLOADS = ima.DOWNLOADS
-OCR_PER_CALL = 120  # ~1.5 s/page; keeps one call well inside the 600 s client timeout
+# where the agent sees the downloads directory (share it as a volume), e.g. /opt/data/ima-downloads
+PUBLIC_DOWNLOADS = os.environ.get('IMA_DOWNLOADS_PUBLIC')
+
+
+def _public(path):
+    if not path or not PUBLIC_DOWNLOADS:
+        return None
+    return os.path.join(PUBLIC_DOWNLOADS, os.path.relpath(path, DOWNLOADS))
 mcp = FastMCP('ima', host=os.environ.get('IMA_MCP_HOST', '0.0.0.0'), port=int(os.environ.get('IMA_MCP_PORT', 8765)),
               instructions=(
                   'Tencent ima knowledge bases (personal, shared and subscribed), read through the official '
@@ -118,7 +125,10 @@ def _load(kb, title, folders):
     p = _cached(title)
     if p:
         with open(p, encoding='utf-8') as f:
-            return json.load(f)
+            doc = json.load(f)
+        # cheap, and keeps old cache entries in step with the current detection rule
+        doc['garbled_pages'] = [i + 1 for i, t in enumerate(doc['pages']) if ima.looks_garbled(t)]
+        return doc
     doc = ima.get_document(kb, title, folders or [])
     os.makedirs(os.path.dirname(_cache_path(doc['title'])), exist_ok=True)
     with open(_cache_path(doc['title']), 'w', encoding='utf-8') as f:
@@ -133,36 +143,37 @@ async def ima_get_document(kb: str, title: str, folders: list[str] | None = None
     kb/title (prefixes ok) locate it; folders is optional - without it the document is found
     by the knowledge base's search. pages: e.g. '1-20,35' (default all).
     Output stops at max_chars; the footer then says which page to continue from.
-    Pages whose embedded fonts have broken maps (text comes out as one repeated character) are
-    OCRed automatically and tagged [OCR]; for charts and multi-column slides look at the page with
-    ima_render_pages. Fetched once, then served from cache."""
+    The header gives `file`, the original PDF as you can open it yourself (tables, charts, your own
+    tools). Pages listed in image_only_pages have no usable text layer (text drawn as outlines):
+    read them as images with ima_render_pages or from the file. Fetched once, then cached."""
     def go():
         doc = _load(kb, title, folders)
         total = len(doc['pages'])
         wanted = ima.parse_pages(pages, total)
-        # garbled pages (broken font maps): OCR the ones asked for, once, and keep the result
-        ocr = doc.setdefault('ocr_pages', [])
-        todo = [n for n in wanted if n in doc['garbled_pages'] and n not in ocr and doc.get('file')]
-        for n in todo[:OCR_PER_CALL]:
-            doc['pages'][n - 1] = ima.ocr_page(doc['file'], n)
-            ocr.append(n)
-        if todo:
-            with open(_cached(doc['title']), 'w', encoding='utf-8') as f:
-                json.dump(doc, f, ensure_ascii=False)
+        garbled = doc['garbled_pages']
         out, used, last = [], 0, None
+        alt = doc.get('alt', {})
         for n in wanted:
-            tag = ' [OCR]' if n in ocr else ''
-            chunk = f'=== page {n}/{total}{tag} ===\n{doc["pages"][n - 1].strip()}\n'
+            if n in garbled:
+                body = ('[no usable text layer: the text on this page is rasterised into images; read it as '
+                        'an image (ima_render_pages, or the file itself)]')
+                if alt.get(str(n)):
+                    body += '\n[the PDF\'s accessibility text for this page (exact, may not cover all of it):]\n' \
+                            + '\n'.join(alt[str(n)])
+            else:
+                body = doc['pages'][n - 1].strip()
+            chunk = f'=== page {n}/{total} ===\n{body}\n'
             if out and used + len(chunk) > max_chars:
                 break
             out.append(chunk)
             used += len(chunk)
             last = n
-        left = [n for n in doc['garbled_pages'] if n not in ocr]
         head = (f'title: {doc["title"]}\nsource: {doc["source"]}\npages: {total}\n'
-                f'ocr_pages: {ocr}' + (f'  (garbled, not OCRed yet: {left})' if left else '') + '\n'
-                + ('note: [OCR] pages had broken font maps; OCR misses some headings and mixes columns, '
-                   'use ima_render_pages to look at charts/slides\n' if ocr else '') + '\n')
+                f'file: {_public(doc.get("file")) or "(not shared with you)"}\n'
+                + (f'text_layer_repaired: {sorted({r[1] for r in doc["repaired"]})} '
+                   f'({len(doc["repaired"])} fonts; the file above is the repaired copy, visuals unchanged)\n'
+                   if doc.get('repaired') else '') +
+                f'image_only_pages: {garbled}\n\n')
         more = [n for n in wanted if n > (last or 0)]
         tail = f'\n[truncated at max_chars: continue with pages="{more[0]}-{more[-1]}"]' if more else ''
         return head + ''.join(out) + tail

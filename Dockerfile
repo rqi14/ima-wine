@@ -40,16 +40,17 @@ RUN apt-get update \
       libxinerama1 libxxf86vm1 libxkbcommon0 libfreetype6 libfontconfig1 libgnutls30t64 \
       libdbus-1-3 libgl1 libegl1 libvulkan1 libudev1 \
       xvfb xauth xdotool imagemagick fonts-wqy-microhei poppler-utils \
-      tesseract-ocr tesseract-ocr-chi-sim \
       ca-certificates curl 7zip socat python3 python3-venv tini \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -m -u 1000 ima && mkdir -p /data && chown ima:ima /data
 # mcp<2: 2.x renamed FastMCP and reshuffled the API; the wire protocol is the same
 RUN python3 -m venv /opt/imactl/venv \
- && /opt/imactl/venv/bin/pip install --no-cache-dir 'mcp<2' websocket-client
+ && /opt/imactl/venv/bin/pip install --no-cache-dir 'mcp<2' websocket-client pypdf fonttools
 COPY --from=wine /opt/wine /opt/wine
 COPY docker/entrypoint.sh /usr/local/bin/ima-entrypoint
 COPY imactl/*.py /opt/imactl/
+# CID -> Unicode tables for repairing Source Han subsets (tools/build_cidmaps.py)
+COPY imactl/cidmaps/ /opt/imactl/cidmaps/
 RUN printf '#!/bin/sh\nexec /opt/imactl/venv/bin/python /opt/imactl/imactl.py "$@"\n' > /usr/local/bin/imactl \
  && chmod 755 /usr/local/bin/imactl /usr/local/bin/ima-entrypoint
 # UTF-8 is not cosmetic: Wine maps Windows file names through the Unix locale, and under the

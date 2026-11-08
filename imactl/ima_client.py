@@ -396,13 +396,187 @@ def close_target(t):
 
 
 # ---------- text ----------
+def is_common(ch):
+    """A character an ordinary Chinese text uses: in GB2312 or Big5. Garbage decodes land in
+    CJK Extension A, compatibility ideographs, radicals - which neither set has."""
+    for enc in ('gb2312', 'big5'):
+        try:
+            if len(ch.encode(enc)) == 2:
+                return True
+        except UnicodeEncodeError:
+            pass
+    return False
+
+
+# ---------- text layer repair: Source Han CID subsets with a broken/partial ToUnicode ----------
+CIDMAPS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cidmaps')
+_cidmaps = {}
+
+
+def cidmaps():
+    """CID -> code point per (family, region, release), built by tools/build_cidmaps.py."""
+    if not _cidmaps and os.path.isdir(CIDMAPS):
+        import gzip
+        for n in sorted(os.listdir(CIDMAPS)):
+            if n.endswith('.json.gz'):
+                with gzip.open(os.path.join(CIDMAPS, n), 'rt', encoding='utf-8') as f:
+                    _cidmaps[n[:-8]] = {int(k): v for k, v in json.load(f).items()}
+    return _cidmaps
+
+
+def _pdf_fonts(res, seen):
+    """Fonts of a resource dict and of the form XObjects it uses, each once (pypdf objects)."""
+    res = res.get_object() if res is not None else {}
+    for ref in (res.get('/Font') or {}).values():
+        f = ref.get_object()
+        key = id(f) if ref is f else (ref.idnum, ref.generation)
+        if key not in seen:
+            seen.add(key)
+            yield f
+    for ref in (res.get('/XObject') or {}).values():
+        x = ref.get_object()
+        if x.get('/Subtype') == '/Form' and '/Resources' in x:
+            yield from _pdf_fonts(x['/Resources'], seen)
+
+
+def _tounicode_stream(mapping):
+    out = [b'/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Adobe-Identity-UCS def '
+           b'/CMapType 2 def 1 begincodespacerange <0000> <FFFF> endcodespacerange']
+    items = sorted(mapping.items())
+    for i in range(0, len(items), 100):
+        chunk = items[i:i + 100]
+        out.append(b'%d beginbfchar' % len(chunk))
+        out += [b'<%04X> <%s>' % (c, s.encode('utf-16-be').hex().upper().encode()) for c, s in chunk]
+        out.append(b'endbfchar')
+    out.append(b'endcmap CMapName currentdict /CMap defineresource pop end end')
+    return b'\n'.join(out)
+
+
+def repair_text_layer(path):
+    """Rewrite the ToUnicode of Source Han / Noto CJK CID subsets from the full fonts' tables.
+    The subsets keep the original CIDs (Identity-H: code == CID); which release/region numbering
+    applies is decided by decoding with every table and keeping the one whose output is ordinary
+    text (>= 85% GB2312/Big5 characters; the wrong release scores ~27%). Visuals are untouched.
+    Returns [(font, table, score)] for the fonts rewritten; saves the file in place if any.
+    pypdf + fontTools, both pure Python: pikepdf would pull lxml and Pillow (~75 MB)."""
+    import io
+    from fontTools.cffLib import CFFFontSet
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, NameObject
+    tables = cidmaps()
+    fixes = []
+    pdf = PdfWriter(clone_from=path)
+    seen = set()
+    for page in pdf.pages:
+        for f in _pdf_fonts(page.get('/Resources'), seen):
+                base = str(f.get('/BaseFont', ''))
+                family = 'Serif' if 'Serif' in base else 'Sans'
+                if f.get('/Subtype') != '/Type0' or str(f.get('/Encoding')) not in ('/Identity-H', '/Identity-V') \
+                        or not ('SourceHan' in base or ('Noto' in base and 'CJK' in base)):
+                    continue
+                try:
+                    desc = f['/DescendantFonts'][0].get_object()['/FontDescriptor'].get_object()
+                    cff = CFFFontSet()
+                    cff.decompile(io.BytesIO(desc['/FontFile3'].get_object().get_data()), None)
+                    top = cff[cff.fontNames[0]]
+                except Exception:
+                    continue
+                if not hasattr(top, 'ROS'):
+                    continue
+                cids = [int(g[3:]) for g in top.charset if g.startswith('cid')]
+                # rank by how many glyphs decode to ordinary characters (rewards the release whose
+                # numbering covers the subset, e.g. Serif 1.000 over 1.001 for 持), gate on the ratio
+                best = None
+                for name, t in tables.items():
+                    if family not in name:
+                        continue
+                    dec = [chr(t[c]) for c in cids if c in t and t[c] >= 0x2E80]
+                    if len(dec) < 5:
+                        continue
+                    common = sum(map(is_common, dec))
+                    rank = (common, -sum(c not in t for c in cids))
+                    if common / len(dec) >= 0.85 and (not best or rank > best[0]):
+                        best = (rank, name, t, common / len(dec))
+                if not best:
+                    continue
+                _, name, t, score = best
+                tu = {}
+                if '/ToUnicode' in f:
+                    for a, b in re.findall(rb'<([0-9A-Fa-f]{4})>\s*<([0-9A-Fa-f]{4,8})>',
+                                           f['/ToUnicode'].get_object().get_data()):
+                        try:
+                            tu[int(a, 16)] = bytes.fromhex(b.decode()).decode('utf-16-be')
+                        except ValueError:
+                            pass
+                both = [c for c in cids if c in t and c in tu]
+                if both and sum(tu[c] == chr(t[c]) for c in both) / len(both) >= 0.95 \
+                        and all(c in tu for c in cids):
+                    continue  # the producer's ToUnicode is fine already
+                # glyphs no release table knows: U+FFFD, an honest "unknown", rather than keeping a
+                # producer entry from a ToUnicode we have just shown to be wrong
+                full = {c: chr(t[c]) if c in t else '�' for c in cids}
+                s = DecodedStreamObject()
+                s.set_data(_tounicode_stream(full))
+                f[NameObject('/ToUnicode')] = pdf._add_object(s)
+                fixes.append((base, name, round(score, 3), sum(c not in t for c in cids)))
+    if fixes:
+        tmp = path + '.repair'
+        with open(tmp, 'wb') as out:
+            pdf.write(out)
+        os.replace(tmp, path)
+    return fixes
+
+
+def struct_alt_text(path):
+    """{page number: [text]} from /ActualText and /Alt of a tagged PDF's structure tree. Producers
+    that rasterise text (Aspose: each run an image under an invisible .notdef text layer) often
+    still write the real words there for accessibility - the only exact source for such pages."""
+    from pypdf import PdfReader
+    r = PdfReader(path)
+    root = r.trailer['/Root'].get_object().get('/StructTreeRoot')
+    if root is None:
+        return {}
+    pages = {p.indirect_reference.idnum: n for n, p in enumerate(r.pages, 1)}
+    out = {}
+
+    def walk(node, page, depth):
+        node = node.get_object() if hasattr(node, 'get_object') else node
+        if depth > 200:
+            return
+        if isinstance(node, list):
+            for k in node:
+                walk(k, page, depth + 1)
+            return
+        if not hasattr(node, 'get'):
+            return
+        pg = node.get('/Pg')
+        page = pages.get(pg.idnum, page) if pg is not None and hasattr(pg, 'idnum') else page
+        text = str(node.get('/ActualText') or node.get('/Alt') or '').replace('\r\n', '\n').replace('\r', '\n').strip()
+        if text and page:
+            out.setdefault(page, []).append(text)
+            return  # the element's text stands for its children
+        if '/K' in node:
+            walk(node['/K'], page, depth + 1)
+
+    walk(root.get('/K'), None, 0)
+    return out
+
+
 def looks_garbled(text):
-    """Broken ToUnicode maps turn every glyph into the same character (机机机机 / 与与与与)."""
+    """A page whose text layer is one character repeated (机机机机 / 与与与与). Seen in Aspose-made
+    PDFs: every text run is rasterised (a 2x2 colour image with a text-shaped soft mask) under an
+    invisible text layer of .notdef glyphs that a broken ToUnicode maps to one character. The words
+    are not in the file except, sometimes, as /Alt text in the structure tree (struct_alt_text);
+    the rest has to be read as images."""
     chars = [c for c in text if not c.isspace() and not c.isascii()]
     if len(chars) < 15:  # covers short cover pages too
         return False
     top = Counter(chars).most_common(1)[0][1]
-    return top >= 8 and top / len(chars) > 0.3
+    if top >= 8 and top / len(chars) > 0.3:
+        return True
+    # unrepaired CID fonts decode to rare characters (Ext-A, compatibility forms, radicals)
+    cjk = [c for c in chars if ord(c) >= 0x2E80]
+    return len(cjk) >= 30 and sum(map(is_common, cjk)) / len(cjk) < 0.5
 
 
 # poppler-utils instead of PyMuPDF: same text, and PyMuPDF 2.x drags in ~270 MB (onnxruntime, numpy)
@@ -410,17 +584,6 @@ def pdf_pages(path):
     text = subprocess.run(['pdftotext', '-enc', 'UTF-8', path, '-'], check=True, capture_output=True).stdout
     pages = text.decode('utf-8', 'replace').split('\f')  # one form feed after every page
     return pages[:-1] if pages and not pages[-1].strip() else pages
-
-
-def ocr_page(path, n, langs='chi_sim+eng'):
-    """Text of page n by OCR, for pages whose embedded fonts have a broken ToUnicode map. The fonts
-    are subsets without a usable cmap either (stripping ToUnicode gives other garbage), so the glyph
-    identities are only recoverable from their shapes. Tesseract: ~1.5 s/page, ~180 MB; misses some
-    light-on-dark headings and reads multi-column slides row-wise - vision is better for those."""
-    png = subprocess.run(['pdftoppm', '-r', '300', '-gray', '-png', '-f', str(n), '-l', str(n), path],
-                         check=True, capture_output=True).stdout
-    return subprocess.run(['tesseract', 'stdin', 'stdout', '-l', langs], input=png,
-                          check=True, capture_output=True).stdout.decode('utf-8', 'replace')
 
 
 def render_pages(path, pages, width=1400):
@@ -441,25 +604,44 @@ def parse_pages(spec, total):
     return [p for p in got if 1 <= p <= total]
 
 
+def find(kb, title):
+    """Leave the KB's search results showing `title`. The search is semantic: a long query (the
+    whole title) can rank the document out of the results, so shorten the query until it shows."""
+    for q in dict.fromkeys((title, title[:12], title[:6])):
+        if any(h['title'].startswith(title) or title.startswith(h['title']) for h in search(kb, q)):
+            return
+    raise ImaError(f'{title!r} not found by searching {kb!r}; try ima_search with a shorter query')
+
+
 def get_document(kb, title, path=(), keep_viewer=False):
     """Full text of a document. Downloads it through the viewer when offered, else reads the viewer."""
     with LOCK:
         if path:
             goto(kb, path)
         else:  # titles from OpenAPI search come without a folder path: find it with the KB's search
-            search(kb, title)
+            find(kb, title)
         name, viewer = open_doc(title)
         try:
             file = download(viewer)
+            repaired, alt = [], {}
             if file:
+                try:
+                    repaired = repair_text_layer(file)
+                except Exception as e:  # a repair failure must not cost us the document
+                    repaired = [('repair failed', str(e)[:200], 0)]
                 texts, source = pdf_pages(file), 'download'
+                try:
+                    alt = struct_alt_text(file)
+                except Exception:
+                    alt = {}
             else:
                 texts, source = read_viewer(viewer), 'viewer'
         finally:
             if not keep_viewer:
                 close_target(viewer)  # a viewer costs ~250 MB
         return {
-            'title': name, 'source': source, 'file': file, 'pages': texts,
+            'title': name, 'source': source, 'file': file, 'pages': texts, 'repaired': repaired,
+            'alt': {str(k): v for k, v in alt.items()},
             'garbled_pages': [i + 1 for i, t in enumerate(texts) if looks_garbled(t)],
         }
 
