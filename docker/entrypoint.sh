@@ -51,6 +51,15 @@ if [ ! -f "$WINEPREFIX/system.reg" ]; then
     WINEDLLOVERRIDES="mscoree,mshtml=" wineboot -i
     wineserver -w
 fi
+# Chromium asks for Windows CJK font names; without these every Chinese glyph in pages and
+# dialogs renders as a box (page text read via DOM is unaffected, screenshots are)
+if [ ! -f "$WINEPREFIX/.fonts-v1" ]; then
+    for f in "Microsoft YaHei" "Microsoft YaHei UI" SimSun NSimSun SimHei "MS Shell Dlg" "MS Shell Dlg 2" "Segoe UI" "PingFang SC"; do
+        wine reg add 'HKCU\Software\Wine\Fonts\Replacements' /v "$f" /t REG_SZ /d "WenQuanYi Micro Hei" /f >/dev/null 2>&1
+    done
+    wineserver -w
+    touch "$WINEPREFIX/.fonts-v1"
+fi
 
 # ---- 4. CDP: Chrome only listens on 127.0.0.1:9222, publish it as 9223 ----
 socat TCP-LISTEN:9223,fork,reuseaddr TCP:127.0.0.1:9222 &
@@ -70,14 +79,17 @@ FLAGS=(
 [ "${IMA_KSM:-1}" = 1 ] && export LD_PRELOAD=/opt/wine/lib/ksm_preload.so
 
 stopping=0
+ima_pid=
 graceful_stop() {
     # ima rotates its login token on every start and Chromium flushes prefs lazily; a hard kill
     # leaves the old (revoked) token on disk and the next start lands on the QR login page.
     stopping=1
     log "closing ima"
     imactl close >/dev/null 2>&1 || true
-    for _ in $(seq 30); do pgrep -f 'ima\.copilot\.exe' >/dev/null || break; sleep 1; done
-    wineserver -k 2>/dev/null || true
+    # the wine launcher lives as long as ima.copilot.exe (no procps in the image: poll the pid)
+    for _ in $(seq 30); do [ -n "$ima_pid" ] && kill -0 "$ima_pid" 2>/dev/null || break; sleep 1; done
+    timeout 10 wineserver -w 2>/dev/null || wineserver -k 2>/dev/null || true
+    log "closed"
     exit 0
 }
 trap graceful_stop TERM INT
@@ -87,7 +99,8 @@ while :; do
     rm -f "$WINEPREFIX/drive_c/ima-profile/Default/Sessions/"* 2>/dev/null || true
     log "starting ima"
     wine "$EXE" "${FLAGS[@]}" >/tmp/ima.log 2>&1 &
-    wait $! || true
+    ima_pid=$!
+    wait $ima_pid || true
     wineserver -w 2>/dev/null || true
     [ $stopping = 1 ] && break
     log "ima exited, restarting in 5s"
