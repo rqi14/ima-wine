@@ -1,0 +1,304 @@
+# Wine: share relocated pages of the shared section copies (on top of 0001).
+#
+# 0001 shares one page-aligned copy of chrome.dll's big read-only sections, but chrome.dll is
+# mapped at the server-assigned dynamic base, not its preferred one, and every process then
+# relocated the copy privately: ~18 MB of dirty, unshared pages per process (x ~40 at startup).
+# wineserver assigns one map address per file, so it can pre-relocate the copy for that address
+# (as the Windows kernel shares relocated image pages); the client skips those blocks when it
+# really sits at that address, and otherwise falls back to private copies. Per-renderer dirty
+# shared-copy pages 18.2 MB -> 40 KB; startup peak (no KSM) ~1500 -> ~1150 MB.
+# The pe_image_info bit comes out of the existing padding; same struct size.
+# Ours, not upstream. LGPL-2.1-or-later.
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 9ecd9b7..1f69345 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2727,6 +2727,10 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
+     NTSTATUS status = STATUS_CONFLICTING_ADDRESSES;
+     int i;
+     off_t pos, copy_pos;
++    /* sections mapped from copies the server already relocated for this address */
++    DWORD prerel_start[96], prerel_end[96];
++    unsigned int nb_prerel = 0;
++    BOOL prerel = image_info->shared_relocated && image_info->map_addr == (ULONG_PTR)view->base;
+     struct stat st;
+     char *header_end;
+     char *ptr = view->base;
+@@ -2863,9 +2867,16 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
+             end <= ((st.st_size + sector_align) & ~sector_align) &&
+             end >= file_start &&
+             shared_fd != -1 && is_shared_copy_section( &sec[i], file_start, file_size ) &&
++            /* a pre-relocated copy is only right at the address it was relocated for */
++            (!image_info->shared_relocated || prerel) &&
+             map_shared_copy_section( view, shared_fd, &copy_pos, &sec[i], file_size ))
+         {
+             /* mapped from the page aligned shared copy */
++            if (prerel && nb_prerel < ARRAY_SIZE(prerel_start))
++            {
++                prerel_start[nb_prerel] = sec[i].VirtualAddress;
++                prerel_end[nb_prerel++] = sec[i].VirtualAddress + ROUND_SIZE( 0, file_size, host_page_mask );
++            }
+         }
+         else if (sec[i].PointerToRawData >= st.st_size ||
+             end > ((st.st_size + sector_align) & ~sector_align) ||
+@@ -2929,7 +2940,20 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
+             IMAGE_BASE_RELOCATION *end = (IMAGE_BASE_RELOCATION *)((char *)rel + dir->Size);
+ 
+             while (rel && rel < end - 1 && rel->SizeOfBlock && rel->VirtualAddress < total_size)
++            {
++                unsigned int k;
++
++                /* blocks in pre-relocated shared copies are done; touching them would unshare the pages.
++                 * Keep in sync with read_copy_relocs() in server/mapping.c */
++                for (k = 0; k < nb_prerel; k++)
++                    if (rel->VirtualAddress >= prerel_start[k] && rel->VirtualAddress < prerel_end[k]) break;
++                if (k < nb_prerel)
++                {
++                    rel = (IMAGE_BASE_RELOCATION *)((char *)rel + rel->SizeOfBlock);
++                    continue;
++                }
+                 rel = process_relocation_block( ptr + rel->VirtualAddress, rel, delta );
++            }
+         }
+     }
+ 
+diff --git a/include/wine/server_protocol.h b/include/wine/server_protocol.h
+index ac5f07e..efd46b1 100644
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -857,7 +857,8 @@ struct pe_image_info
+     unsigned char  wine_builtin : 1;
+     unsigned char  wine_fakedll : 1;
+     unsigned char  is_hybrid : 1;
+-    unsigned char  padding : 4;
++    unsigned char  shared_relocated : 1;
++    unsigned char  padding : 3;
+     unsigned char  image_flags;
+     unsigned int   loader_flags;
+     unsigned int   header_size;
+diff --git a/server/mapping.c b/server/mapping.c
+index e72e189..6b3b8c3 100644
+--- a/server/mapping.c
++++ b/server/mapping.c
+@@ -592,6 +592,117 @@ static int is_shared_copy_section( const IMAGE_SECTION_HEADER *sec, size_t file_
+     return 1;
+ }
+ 
++static client_ptr_t assign_map_address( struct mapping *mapping );
++
++/* Base relocations that fall in the shared section copies, for pre-relocating the copies.
++ * Only used when every such block is well formed: DIR64/HIGHLOW/ABSOLUTE entries that stay
++ * inside the copy. Otherwise NULL and the client relocates as usual.
++ * Keep the copy range rule in sync with the relocation skip in dlls/ntdll/unix/virtual.c */
++static IMAGE_BASE_RELOCATION *read_copy_relocs( int fd, const IMAGE_DATA_DIRECTORY *dir, size_t align_mask,
++                                                IMAGE_SECTION_HEADER *sec, unsigned int nb_sec, size_t *ret_size )
++{
++    IMAGE_BASE_RELOCATION *relocs = NULL, *rel, *end;
++    size_t map_size, file_size;
++    off_t read_pos;
++    unsigned int i;
++
++    if (!dir || !dir->Size) return NULL;
++    for (i = 0; i < nb_sec && !relocs; i++)
++    {
++        get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
++        if (dir->VirtualAddress < sec[i].VirtualAddress ||
++            dir->VirtualAddress + dir->Size > sec[i].VirtualAddress + file_size) continue;
++        if (!(relocs = malloc( dir->Size ))) return NULL;
++        if (pread( fd, relocs, dir->Size, read_pos + dir->VirtualAddress - sec[i].VirtualAddress ) != dir->Size)
++        {
++            free( relocs );
++            return NULL;
++        }
++    }
++    if (!relocs) return NULL;
++
++    end = (IMAGE_BASE_RELOCATION *)((char *)relocs + dir->Size);
++    for (rel = relocs; rel + 1 <= end && rel->SizeOfBlock; rel = (IMAGE_BASE_RELOCATION *)((char *)rel + rel->SizeOfBlock))
++    {
++        USHORT *entry = (USHORT *)(rel + 1);
++        unsigned int count;
++        size_t range = 0;
++
++        if (rel->SizeOfBlock < sizeof(*rel) || (char *)rel + rel->SizeOfBlock > (char *)end) goto invalid;
++        for (i = 0; i < nb_sec; i++)
++        {
++            get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
++            if (!is_shared_copy_section( &sec[i], read_pos, file_size )) continue;
++            if (rel->VirtualAddress < sec[i].VirtualAddress ||
++                rel->VirtualAddress >= sec[i].VirtualAddress + round_size( file_size, host_page_mask )) continue;
++            range = sec[i].VirtualAddress + round_size( file_size, host_page_mask ) - rel->VirtualAddress;
++            break;
++        }
++        if (!range) continue;  /* not in a copy: the client handles it */
++        for (count = (rel->SizeOfBlock - sizeof(*rel)) / sizeof(USHORT); count; count--, entry++)
++        {
++            USHORT offset = *entry & 0xfff;
++            switch (*entry >> 12)
++            {
++            case IMAGE_REL_BASED_ABSOLUTE: break;
++            case IMAGE_REL_BASED_HIGHLOW: if (offset + 4 > range) goto invalid; break;
++            case IMAGE_REL_BASED_DIR64: if (offset + 8 > range) goto invalid; break;
++            default: goto invalid;
++            }
++        }
++    }
++    *ret_size = dir->Size;
++    return relocs;
++
++invalid:
++    free( relocs );
++    return NULL;
++}
++
++/* apply the relocations that fall in the copies to the shared temp file */
++static int relocate_copies( int shared_fd, size_t copy_base, size_t copy_size, client_ptr_t delta,
++                            IMAGE_BASE_RELOCATION *relocs, size_t relocs_size, size_t align_mask,
++                            IMAGE_SECTION_HEADER *sec, unsigned int nb_sec )
++{
++    IMAGE_BASE_RELOCATION *rel, *end = (IMAGE_BASE_RELOCATION *)((char *)relocs + relocs_size);
++    size_t map_size, file_size, copy_off;
++    off_t read_pos;
++    unsigned int i;
++    char *copies;
++
++    copies = mmap( NULL, copy_size, PROT_READ | PROT_WRITE, MAP_SHARED, shared_fd, copy_base );
++    if (copies == MAP_FAILED) return 0;
++    for (rel = relocs; rel + 1 <= end && rel->SizeOfBlock; rel = (IMAGE_BASE_RELOCATION *)((char *)rel + rel->SizeOfBlock))
++    {
++        USHORT *entry = (USHORT *)(rel + 1);
++        unsigned int count;
++        char *page = NULL;
++
++        copy_off = 0;
++        for (i = 0; i < nb_sec; i++)
++        {
++            get_section_sizes( &sec[i], align_mask, &map_size, &read_pos, &file_size );
++            if (!is_shared_copy_section( &sec[i], read_pos, file_size )) continue;
++            if (rel->VirtualAddress >= sec[i].VirtualAddress &&
++                rel->VirtualAddress < sec[i].VirtualAddress + round_size( file_size, host_page_mask ))
++            {
++                page = copies + copy_off + rel->VirtualAddress - sec[i].VirtualAddress;
++                break;
++            }
++            copy_off += round_size( file_size, host_page_mask );
++        }
++        if (!page) continue;
++        for (count = (rel->SizeOfBlock - sizeof(*rel)) / sizeof(USHORT); count; count--, entry++)
++        {
++            USHORT offset = *entry & 0xfff;
++            if ((*entry >> 12) == IMAGE_REL_BASED_DIR64) *(INT64 *)(page + offset) += delta;
++            else if ((*entry >> 12) == IMAGE_REL_BASED_HIGHLOW) *(int *)(page + offset) += delta;
++        }
++    }
++    munmap( copies, copy_size );
++    return 1;
++}
++
+ /* copy a section from the image file to the shared temp file, in chunks */
+ static int copy_to_shared_file( int fd, int shared_fd, off_t read_pos, size_t size, off_t write_pos )
+ {
+@@ -625,8 +736,11 @@ static int copy_to_shared_file( int fd, int shared_fd, off_t read_pos, size_t si
+ 
+ /* allocate and fill the temp file for a shared PE image mapping */
+ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int fd,
+-                                 IMAGE_SECTION_HEADER *sec, unsigned int nb_sec )
++                                 IMAGE_SECTION_HEADER *sec, unsigned int nb_sec,
++                                 const IMAGE_DATA_DIRECTORY *reloc_dir )
+ {
++    IMAGE_BASE_RELOCATION *relocs = NULL;
++    size_t relocs_size = 0;
+     struct shared_map *shared;
+     struct file *file;
+     unsigned int i;
+@@ -666,7 +780,24 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
+ 
+     if (!total_size) return 1;  /* nothing to do */
+ 
+-    if ((mapping->shared = get_shared_file( mapping->fd ))) return 1;
++    /* Pre-relocate the copies for the address the server hands out for this file, so that the
++     * relocated pages stay shared too (on Windows the kernel shares relocated image pages).
++     * The decision is deterministic per file, so a reused shared file matches it. */
++    mapping->image.shared_relocated = 0;
++    if (copy_size && (mapping->image.image_charact & IMAGE_FILE_DLL) &&
++        (mapping->image.image_flags & IMAGE_FLAGS_ImageDynamicallyRelocated))
++    {
++        if (!mapping->image.map_addr) mapping->image.map_addr = assign_map_address( mapping );
++        if (mapping->image.map_addr && mapping->image.map_addr != mapping->image.base &&
++            (relocs = read_copy_relocs( fd, reloc_dir, align_mask, sec, nb_sec, &relocs_size )))
++            mapping->image.shared_relocated = 1;
++    }
++
++    if ((mapping->shared = get_shared_file( mapping->fd )))
++    {
++        free( relocs );
++        return 1;
++    }
+ 
+     /* create a temp file for the mapping */
+ 
+@@ -710,17 +841,24 @@ static int build_shared_mapping( struct mapping *mapping, size_t align_mask, int
+         if (pwrite( shared_fd, buffer, file_size, write_pos ) != file_size) goto error;
+     }
+ 
++    if (relocs && !relocate_copies( shared_fd, copy_base, copy_size,
++                                    mapping->image.map_addr - mapping->image.base,
++                                    relocs, relocs_size, align_mask, sec, nb_sec )) goto error;
++
+     if (!(shared = alloc_object( &shared_map_ops ))) goto error;
+     shared->fd = (struct fd *)grab_object( mapping->fd );
+     shared->file = file;
+     list_add_head( &shared_map_list, &shared->entry );
+     mapping->shared = shared;
+     free( buffer );
++    free( relocs );
+     return 1;
+ 
+  error:
+     release_object( file );
+     free( buffer );
++    free( relocs );
++    mapping->image.shared_relocated = 0;
+     return 0;
+ }
+ 
+@@ -902,7 +1040,7 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
+     } cfg;
+     off_t pos;
+     int size, has_relocs;
+-    IMAGE_DATA_DIRECTORY *data_dirs, *exp_dir, *res_dir, *cfg_dir, *clr_dir;
++    IMAGE_DATA_DIRECTORY *data_dirs, *exp_dir, *res_dir, *cfg_dir, *clr_dir, *reloc_dir;
+     size_t mz_size, align_mask;
+     unsigned int i, ret, nb_data_dirs;
+ 
+@@ -1007,6 +1145,7 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
+     (dir < nb_data_dirs && data_dirs[dir].VirtualAddress && data_dirs[dir].Size ? &data_dirs[dir] : NULL)
+ 
+     exp_dir = GET_DATA_DIR( IMAGE_DIRECTORY_ENTRY_EXPORT );
++    reloc_dir = GET_DATA_DIR( IMAGE_DIRECTORY_ENTRY_BASERELOC );
+     res_dir = GET_DATA_DIR( IMAGE_DIRECTORY_ENTRY_RESOURCE );
+     cfg_dir = GET_DATA_DIR( IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG );
+     clr_dir = GET_DATA_DIR( IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR );
+@@ -1090,7 +1229,7 @@ static unsigned int get_image_params( struct mapping *mapping, file_pos_t file_s
+             mapping->image.is_hybrid = !!cfg.cfg64.CHPEMetadataPointer;
+     }
+ 
+-    if (build_shared_mapping( mapping, align_mask, unix_fd, sec, nt.FileHeader.NumberOfSections ))
++    if (build_shared_mapping( mapping, align_mask, unix_fd, sec, nt.FileHeader.NumberOfSections, reloc_dir ))
+         ret = STATUS_SUCCESS;
+ 
+ done:
+diff --git a/server/protocol.def b/server/protocol.def
+index c5901e2..878c61e 100644
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -873,7 +873,8 @@ struct pe_image_info
+     unsigned char  wine_builtin : 1;
+     unsigned char  wine_fakedll : 1;
+     unsigned char  is_hybrid : 1;
+-    unsigned char  padding : 4;
++    unsigned char  shared_relocated : 1;
++    unsigned char  padding : 3;
+     unsigned char  image_flags;
+     unsigned int   loader_flags;
+     unsigned int   header_size;

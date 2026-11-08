@@ -26,7 +26,8 @@ def main():
     sp.add_parser('close')
     sp.add_parser('kbs')
     p = sp.add_parser('ls'); p.add_argument('kb'); p.add_argument('folders', nargs='*')
-    p = sp.add_parser('get', help='full text of a document')
+    p = sp.add_parser('search'); p.add_argument('kb'); p.add_argument('query')
+    p = sp.add_parser('get', help='full text of a document (folders optional: found by search)')
     p.add_argument('kb'); p.add_argument('path', nargs='+', help='folders..., title')
     a = ap.parse_args()
     try:
@@ -44,6 +45,9 @@ def main():
             ima.goto(a.kb, a.folders)
             for i in ima.ls()['items']:
                 print(('F  ' if i['type'] == 'folder' else 'D  ') + i['title'] + f'    [{i["meta"]}]')
+        elif a.cmd == 'search':
+            for r in ima.search(a.kb, a.query):
+                print(f"{r['title']}    [{r['snippet']}]")
         elif a.cmd == 'get':
             *folders, title = a.path
             doc = ima.get_document(a.kb, title, folders)

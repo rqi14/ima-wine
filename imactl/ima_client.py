@@ -266,6 +266,33 @@ def goto(kb, path=()):
         cd(folder)
 
 
+def search(kb, query):
+    """The knowledge base's own full-text search (the magnifier next to 内容). Leaves the view on
+    the results, so open_doc() can click one. Returns [{title, snippet}], one per document."""
+    open_kb(kb)
+    t = kb_page()
+    before = _js(t, SNAPSHOT)
+    ok = _js(t, '''const ed = () => $$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0);
+        if (!ed()) { const b = $$('.icon-search-normal[class*="_titleIcon_"]').find(e => e.offsetParent); if (b) b.click(); }
+        return true''')
+    time.sleep(1)
+    ok = _js(t, '''const e = $$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0);
+        if (!e) return false; e.focus(); document.execCommand('selectAll'); document.execCommand('delete'); return true''')
+    if not ok:
+        raise ImaError('knowledge base search box not found')
+    t.call('Input.insertText', text=query)
+    for typ in ('keyDown', 'keyUp'):
+        t.call('Input.dispatchKeyEvent', type=typ, key='Enter', code='Enter', windowsVirtualKeyCode=13)
+    _await_change(t, before, timeout=15)
+    seen, out = set(), []
+    for i in ls()['items']:
+        if i['type'] == 'document' and i['title'] not in seen:
+            seen.add(i['title'])
+            snippet = re.sub(r'\s*\S+\s+\S+$', '', i['meta'])  # drop the trailing "PDF 5/20"
+            out.append({'title': i['title'], 'snippet': snippet.replace('\\n', ' ').strip()})
+    return out
+
+
 # ---------- documents ----------
 def _viewer(wait):
     end = time.time() + wait
@@ -372,9 +399,10 @@ def close_target(t):
 def looks_garbled(text):
     """Broken ToUnicode maps turn every glyph into the same character (机机机机 / 与与与与)."""
     chars = [c for c in text if not c.isspace() and not c.isascii()]
-    if len(chars) < 40:
+    if len(chars) < 15:  # covers short cover pages too
         return False
-    return Counter(chars).most_common(1)[0][1] / len(chars) > 0.3
+    top = Counter(chars).most_common(1)[0][1]
+    return top >= 8 and top / len(chars) > 0.3
 
 
 # poppler-utils instead of PyMuPDF: same text, and PyMuPDF 2.x drags in ~270 MB (onnxruntime, numpy)
@@ -382,6 +410,17 @@ def pdf_pages(path):
     text = subprocess.run(['pdftotext', '-enc', 'UTF-8', path, '-'], check=True, capture_output=True).stdout
     pages = text.decode('utf-8', 'replace').split('\f')  # one form feed after every page
     return pages[:-1] if pages and not pages[-1].strip() else pages
+
+
+def ocr_page(path, n, langs='chi_sim+eng'):
+    """Text of page n by OCR, for pages whose embedded fonts have a broken ToUnicode map. The fonts
+    are subsets without a usable cmap either (stripping ToUnicode gives other garbage), so the glyph
+    identities are only recoverable from their shapes. Tesseract: ~1.5 s/page, ~180 MB; misses some
+    light-on-dark headings and reads multi-column slides row-wise - vision is better for those."""
+    png = subprocess.run(['pdftoppm', '-r', '300', '-gray', '-png', '-f', str(n), '-l', str(n), path],
+                         check=True, capture_output=True).stdout
+    return subprocess.run(['tesseract', 'stdin', 'stdout', '-l', langs], input=png,
+                          check=True, capture_output=True).stdout.decode('utf-8', 'replace')
 
 
 def render_pages(path, pages, width=1400):
@@ -405,7 +444,10 @@ def parse_pages(spec, total):
 def get_document(kb, title, path=(), keep_viewer=False):
     """Full text of a document. Downloads it through the viewer when offered, else reads the viewer."""
     with LOCK:
-        goto(kb, path)
+        if path:
+            goto(kb, path)
+        else:  # titles from OpenAPI search come without a folder path: find it with the KB's search
+            search(kb, title)
         name, viewer = open_doc(title)
         try:
             file = download(viewer)
@@ -426,5 +468,7 @@ if __name__ == '__main__':  # self-check of the pure helpers
     assert parse_pages('1-3,7,99', 10) == [1, 2, 3, 7]
     assert parse_pages('', 3) == [1, 2, 3]
     assert looks_garbled('机' * 50 + '的')
+    assert looks_garbled('2026年中国磁悬浮柔性输送系统研究报告' + '与' * 13)  # a garbled cover page
+    assert not looks_garbled('目录 磁悬浮柔性输送系统产品概要 中国市场分析 本土重点企业分析')
     assert not looks_garbled('人形机器人关节模组市场规模预计在二零三零年达到数百亿元，主要驱动力来自产业链降本与应用落地。' * 2)
     print('ok')

@@ -40,6 +40,7 @@ RUN apt-get update \
       libxinerama1 libxxf86vm1 libxkbcommon0 libfreetype6 libfontconfig1 libgnutls30t64 \
       libdbus-1-3 libgl1 libegl1 libvulkan1 libudev1 \
       xvfb xauth xdotool imagemagick fonts-wqy-microhei poppler-utils \
+      tesseract-ocr tesseract-ocr-chi-sim \
       ca-certificates curl 7zip socat python3 python3-venv tini \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -m -u 1000 ima && mkdir -p /data && chown ima:ima /data
@@ -53,10 +54,13 @@ RUN printf '#!/bin/sh\nexec /opt/imactl/venv/bin/python /opt/imactl/imactl.py "$
  && chmod 755 /usr/local/bin/imactl /usr/local/bin/ima-entrypoint
 # UTF-8 is not cosmetic: Wine maps Windows file names through the Unix locale, and under the
 # default C locale every non-ASCII name (i.e. every Chinese download) fails to be created.
+# No Mono/Gecko: whenever wineboot updates the prefix (any rebuilt Wine) it offers to install
+# them in a dialog on the invisible display and hangs there; ima needs neither.
 ENV PATH=/opt/wine/bin:$PATH \
     LANG=C.UTF-8 LC_ALL=C.UTF-8 \
     WINEPREFIX=/data/prefix \
     WINEDEBUG=-all \
+    WINEDLLOVERRIDES="mscoree,mshtml=" \
     DISPLAY=:99
 USER ima
 VOLUME /data

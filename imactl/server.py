@@ -15,11 +15,13 @@ from mcp.server.fastmcp import FastMCP, Image
 import ima_client as ima
 
 DOWNLOADS = ima.DOWNLOADS
+OCR_PER_CALL = 120  # ~1.5 s/page; keeps one call well inside the 600 s client timeout
 mcp = FastMCP('ima', host=os.environ.get('IMA_MCP_HOST', '0.0.0.0'), port=int(os.environ.get('IMA_MCP_PORT', 8765)),
               instructions=(
                   'Tencent ima knowledge bases (personal, shared and subscribed), read through the official '
-                  'desktop client. Browse with ima_list_knowledge_bases / ima_list, read with ima_get_document '
-                  '(full text, page-separated). If a tool says the client is logged out, send the QR image it '
+                  'desktop client. Find documents with ima_search (full text, per knowledge base) or browse with '
+                  'ima_list_knowledge_bases / ima_list; read with ima_get_document (full text, page-separated; '
+                  'no folder path needed). If a tool says the client is logged out, send the QR image it '
                   'returns to the user to scan with WeChat, then call ima_login_wait.'))
 
 
@@ -90,6 +92,13 @@ async def ima_list(kb: str, folders: list[str] | None = None):
     return await guarded(go)
 
 
+@mcp.tool()
+async def ima_search(kb: str, query: str):
+    """Full-text search inside one knowledge base (the client's own search, so it also covers
+    subscribed and shared libraries). Returns [{title, snippet}]; pass a title to ima_get_document."""
+    return await guarded(lambda: json.dumps(ima.search(kb, query), ensure_ascii=False))
+
+
 # ---------- reading ----------
 def _cache_path(title):
     return os.path.join(DOWNLOADS, '.text', title + '.json')
@@ -121,24 +130,40 @@ def _load(kb, title, folders):
 async def ima_get_document(kb: str, title: str, folders: list[str] | None = None,
                            pages: str | None = None, max_chars: int = 60000) -> str:
     """Full text of a document in a knowledge base, page-separated ('=== page N/M ===').
-    kb/folders/title locate it like ima_list (prefixes ok). pages: e.g. '1-20,35' (default all).
+    kb/title (prefixes ok) locate it; folders is optional - without it the document is found
+    by the knowledge base's search. pages: e.g. '1-20,35' (default all).
     Output stops at max_chars; the footer then says which page to continue from.
-    Pages listed under garbled_pages have broken font maps (or are scans): use ima_render_pages
-    to look at them as images. Fetched once, then served from cache."""
+    Pages whose embedded fonts have broken maps (text comes out as one repeated character) are
+    OCRed automatically and tagged [OCR]; for charts and multi-column slides look at the page with
+    ima_render_pages. Fetched once, then served from cache."""
     def go():
         doc = _load(kb, title, folders)
         total = len(doc['pages'])
+        wanted = ima.parse_pages(pages, total)
+        # garbled pages (broken font maps): OCR the ones asked for, once, and keep the result
+        ocr = doc.setdefault('ocr_pages', [])
+        todo = [n for n in wanted if n in doc['garbled_pages'] and n not in ocr and doc.get('file')]
+        for n in todo[:OCR_PER_CALL]:
+            doc['pages'][n - 1] = ima.ocr_page(doc['file'], n)
+            ocr.append(n)
+        if todo:
+            with open(_cached(doc['title']), 'w', encoding='utf-8') as f:
+                json.dump(doc, f, ensure_ascii=False)
         out, used, last = [], 0, None
-        for n in ima.parse_pages(pages, total):
-            chunk = f'=== page {n}/{total} ===\n{doc["pages"][n - 1].strip()}\n'
+        for n in wanted:
+            tag = ' [OCR]' if n in ocr else ''
+            chunk = f'=== page {n}/{total}{tag} ===\n{doc["pages"][n - 1].strip()}\n'
             if out and used + len(chunk) > max_chars:
                 break
             out.append(chunk)
             used += len(chunk)
             last = n
+        left = [n for n in doc['garbled_pages'] if n not in ocr]
         head = (f'title: {doc["title"]}\nsource: {doc["source"]}\npages: {total}\n'
-                f'garbled_pages: {doc["garbled_pages"]}\n\n')
-        more = [n for n in ima.parse_pages(pages, total) if n > (last or 0)]
+                f'ocr_pages: {ocr}' + (f'  (garbled, not OCRed yet: {left})' if left else '') + '\n'
+                + ('note: [OCR] pages had broken font maps; OCR misses some headings and mixes columns, '
+                   'use ima_render_pages to look at charts/slides\n' if ocr else '') + '\n')
+        more = [n for n in wanted if n > (last or 0)]
         tail = f'\n[truncated at max_chars: continue with pages="{more[0]}-{more[-1]}"]' if more else ''
         return head + ''.join(out) + tail
     return await guarded(go)
