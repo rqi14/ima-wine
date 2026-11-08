@@ -127,3 +127,14 @@ mcp_servers:
 
 Wine 补丁沿用 Wine 的 LGPL-2.1-or-later。ima 是腾讯的闭源软件，本仓库和镜像都不分发它。
 从知识库下载的文档受原权利人约束，仅供账号持有人自己使用。
+
+## 构建与发布
+
+Wine 全量编译在 32 核上约 15 分钟，GitHub Actions 的 4 核机器要一小时左右，所以镜像在本地构建后直接推送：
+
+```bash
+docker build -t ghcr.io/rqi14/ima-wine:latest .
+docker push ghcr.io/rqi14/ima-wine:latest     # 需要 write:packages 权限
+```
+
+`.github/workflows/image.yml` 只保留手动触发，作为没有本地构建机时的后备。

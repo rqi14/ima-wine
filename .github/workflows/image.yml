@@ -1,9 +1,6 @@
 name: image
 
 on:
-  push:
-    branches: [main]
-    paths: [Dockerfile, 'wine/**', 'docker/**', 'imactl/**', .github/workflows/image.yml]
   workflow_dispatch:
 
 permissions:
