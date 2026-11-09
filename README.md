@@ -119,6 +119,7 @@ mcp_servers:
 | `ima_login_wait` | 等用户扫完 |
 | `ima_list_knowledge_bases` | 全部知识库：个人、共享、订阅 |
 | `ima_search(kb, query)` | 库内全文检索（客户端自带搜索，订阅库 / 共享库也行），返回标题与片段 |
+| `ima_ask(kb, question)` | 库自带的 AI 问答（基于知识库提问）；库主把文件设为不可查看时仍可用，返回的是模型概括 |
 | `ima_list(kb, folders)` | 某库 / 某文件夹下的条目 |
 | `ima_get_document(kb, title, folders, pages, max_chars)` | **全文**，按页分隔，外加 agent 可直接打开的 PDF 路径；不给 `folders` 就用库内搜索定位；超长时告诉从哪页接着要 |
 | `ima_render_pages(title, pages)` | 指定页的图片（乱码页、扫描件、图表） |
@@ -127,6 +128,8 @@ mcp_servers:
 - **全文怎么来**：在客户端里点开文档，按阅读器自带的「下载」，拿到原文件后 `pdftotext` 抽全文，阅读器随即关掉。
   客户端不给下载的文档，就把阅读器从头滚到尾、等每页渲染完再收集文字层。agent 只看到全文，看不到阅读器。
 - **缓存**：全文按页缓存在 `/data/downloads/.text/`，同一份文档第二次起直接返回。
+- **库主限制**：有的订阅库把部分文件设为「不可查看」，点开时 ima 只弹一句提示、不开阅读器。
+  `ima_get_document` 认出这句提示后立即返回原因，不去绕；此时用 `ima_ask` 向该库提问。
 - **登录**：每个工具先查登录状态；掉线时返回 `NOT_LOGGED_IN` 和一张新二维码，agent 发给用户扫，再调 `ima_login_wait`。
 - 名字可以只写前缀；客户端只有一个界面，所有操作串行执行。
 

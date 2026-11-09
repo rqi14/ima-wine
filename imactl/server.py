@@ -106,6 +106,20 @@ async def ima_search(kb: str, query: str):
     return await guarded(lambda: json.dumps(ima.search(kb, query), ensure_ascii=False))
 
 
+@mcp.tool()
+async def ima_ask(kb: str, question: str):
+    """Ask the knowledge base's built-in AI Q&A (ima's 基于知识库提问). Use it when ima_get_document
+    reports a file the owner made not viewable, or to find which documents cover a topic. The
+    answer is ima's model summarising the library - name the report (institution, title, date) in
+    the question, and treat figures in the answer as leads to verify, not as the original text."""
+    def go():
+        r = ima.ask(kb, question)
+        src = '\n'.join(f'- {s}' for s in r['sources'][:20])
+        return (f'[ima knowledge-base AI answer - a model summary, not the original document]\n\n{r["answer"]}'
+                + (f'\n\nsources cited by ima:\n{src}' if src else ''))
+    return await guarded(go)
+
+
 # ---------- reading ----------
 def _cache_path(title):
     return os.path.join(DOWNLOADS, '.text', title + '.json')

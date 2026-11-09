@@ -260,6 +260,37 @@ def cd(name):
     return r
 
 
+def ask(kb, question, timeout=300):
+    """Ask the knowledge base's own AI Q&A (the 基于知识库提问 box). This still works when the owner
+    made files not viewable (文件被设为不可查看). Returns {answer, sources}; the answer is ima's
+    model summarising the library, not the original text."""
+    with LOCK:
+        open_kb(kb)
+        t = kb_page()
+        bubbles = 'return $$(\'[class*="_normalModeAiBubbleWrapper_"]\').filter(x => x.offsetWidth > 0)'
+        n0 = len(_js(t, bubbles + '.map(x => 1)'))
+        if not _js(t, '''const e = $$(".tiptap[contenteditable=true]").find(x => x.offsetWidth > 0); if (!e) return false;
+                         e.focus(); document.execCommand("selectAll"); document.execCommand("delete"); return true'''):
+            raise ImaError('the knowledge base Q&A box was not found')
+        t.call('Input.insertText', text=question)
+        time.sleep(0.5)
+        if not _js(t, 'const b = $$(".icon-send").find(x => x.offsetParent); if (!b) return false; b.click(); return true'):
+            raise ImaError('the Q&A send button was not found')
+        last, stable, end = None, 0, time.time() + timeout
+        while time.time() < end:
+            time.sleep(2)
+            cur = _js(t, bubbles + '''.slice(%d).map(b => ({text: (b.querySelector('[class*="_bubble_"]') || b).innerText || '',
+                sources: [...b.querySelectorAll('[class*="_sourceInfo_"]')].map(s => (s.innerText || '').trim())}))''' % n0)
+            if cur and cur[-1]['text'].strip():
+                stable = stable + 1 if cur[-1] == last else 0
+                last = cur[-1]
+                if stable >= 4:  # 8 s without a change: generation is over
+                    break
+        if not last:
+            raise ImaError(f'no answer within {timeout}s')
+        return {'answer': last['text'].strip(), 'sources': list(dict.fromkeys(s for s in last['sources'] if s))}
+
+
 def goto(kb, path=()):
     open_kb(kb)
     for folder in path:
@@ -305,11 +336,24 @@ def _viewer(wait):
         time.sleep(0.5)
 
 
+class Restricted(ImaError):
+    """The knowledge base's owner does not let subscribers open this file (ima: 文件被设为不可查看)."""
+
+
+# toasts ima shows instead of opening a file; seen: 文件被设为不可查看
+TOAST_WATCH = '''window.__imaToasts = []; if (!window.__imaToastObs) { window.__imaToastObs = new MutationObserver(ms => {
+    for (const m of ms) for (const n of m.addedNodes) { const s = (n.innerText || n.textContent || '').trim();
+        if (s && s.length < 120) window.__imaToasts.push(s) } });
+    window.__imaToastObs.observe(document.body, {childList: true, subtree: true}) } 1'''
+
+
 def open_doc(title):
     ls()  # wait for the rows to render
+    t = kb_page()
     before = {x['id'] for x in targets()}
-    r = _js(kb_page(), f'const i = pick(items().filter(x => !x.folder), "title", {json.dumps(title)}); '
-                       'if (!i) return null; i.el.click(); return i.title')
+    t.js(TOAST_WATCH)
+    r = _js(t, f'const i = pick(items().filter(x => !x.folder), "title", {json.dumps(title)}); '
+               'if (!i) return null; i.el.click(); return i.title')
     if not r:
         raise ImaError(f'no document {title!r} here; items: {[i["title"] for i in ls()["items"]]}')
     end = time.time() + 30
@@ -317,6 +361,10 @@ def open_doc(title):
         new = [x for x in targets() if x['id'] not in before and x['type'] == 'page']
         if new:
             return r, new[0]
+        toasts = [s for s in (t.js('window.__imaToasts') or []) if '不可查看' in s or '无权' in s or '没有权限' in s]
+        if toasts:
+            raise Restricted(f'{r}: ima says "{toasts[0]}" - the knowledge base owner does not let subscribers '
+                             f'open this file. ima_ask can still query the knowledge base about it.')
         time.sleep(0.5)
     raise ImaError(f'{r}: no viewer appeared within 30s')
 
