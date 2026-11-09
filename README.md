@@ -163,11 +163,14 @@ Wine 补丁沿用 Wine 的 LGPL-2.1-or-later。ima 是腾讯的闭源软件，�
 
 ## 构建与发布
 
-Wine 全量编译在 32 核上约 15 分钟，GitHub Actions 的 4 核机器要一小时左右，所以镜像在本地构建后直接推送：
+Wine 全量编译在 32 核上约 15 分钟，GitHub Actions 的 4 核机器要一小时左右，所以镜像在本地构建，
+直接传到运行它的机器（不经镜像仓库），再顺手推一份到 GHCR 给别人用：
 
 ```bash
 docker build -t ghcr.io/rqi14/ima-wine:latest .
-docker push ghcr.io/rqi14/ima-wine:latest     # 需要 write:packages 权限
+docker save ghcr.io/rqi14/ima-wine:latest | gzip -1 | ssh <host> "gunzip | sudo docker load"
+ssh <host> "sudo docker compose up -d ima"    # compose 里 pull_policy: never
+docker push ghcr.io/rqi14/ima-wine:latest     # 公开镜像，需要 write:packages 权限
 ```
 
 `.github/workflows/image.yml` 只保留手动触发，作为没有本地构建机时的后备。
