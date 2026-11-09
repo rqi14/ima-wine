@@ -2,6 +2,17 @@
 # Start Xvfb, fetch ima on first run, launch it under Wine with CDP enabled, keep it running.
 set -euo pipefail
 
+# Started as root only to hand the mounted volumes to the ima user (a bind mount that did not
+# exist is created root-owned by Docker), then everything runs as ima.
+if [ "$(id -u)" = 0 ]; then
+    for d in /data /data/downloads; do
+        mkdir -p "$d"
+        [ "$(stat -c %u "$d")" = 1000 ] || chown 1000:1000 "$d"
+    done
+    export HOME=/home/ima
+    exec setpriv --reuid=ima --regid=ima --init-groups "$0" "$@"
+fi
+
 # Official full installer URL, as reported by ima's own updater (app_updater_win.cc in its log).
 # Override both to pin another version; md5 is checked before extraction.
 IMA_URL=${IMA_URL:-https://app-dl.ima.qq.com/reshub/924cd926ee/ima-app-win/formal/20261030213544660/Production/ima.copilot_win_x64_2.6.16_5304_1018_1384.exe}
@@ -37,8 +48,6 @@ for ext in "$APP"/Chrome-bin/*/Extensions; do
     mkdir -p "$ext.off"
     for id in $IMA_DROP_EXTENSIONS; do [ -f "$ext/$id.json" ] && mv "$ext/$id.json" "$ext.off/"; done
 done
-
-mkdir -p /data/downloads
 
 # ---- 2. display ----
 rm -f /tmp/.X99-lock /tmp/.X11-unix/X99

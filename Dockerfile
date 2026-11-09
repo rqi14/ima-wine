@@ -47,12 +47,11 @@ RUN apt-get update \
 RUN python3 -m venv /opt/imactl/venv \
  && /opt/imactl/venv/bin/pip install --no-cache-dir 'mcp<2' websocket-client pypdf fonttools
 COPY --from=wine /opt/wine /opt/wine
-COPY docker/entrypoint.sh /usr/local/bin/ima-entrypoint
 COPY imactl/*.py /opt/imactl/
 # CID -> Unicode tables for repairing Source Han subsets (tools/build_cidmaps.py)
 COPY imactl/cidmaps/ /opt/imactl/cidmaps/
-RUN printf '#!/bin/sh\nexec /opt/imactl/venv/bin/python /opt/imactl/imactl.py "$@"\n' > /usr/local/bin/imactl \
- && chmod 755 /usr/local/bin/imactl /usr/local/bin/ima-entrypoint
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/ima-entrypoint
+COPY --chmod=755 docker/imactl /usr/local/bin/imactl
 # UTF-8 is not cosmetic: Wine maps Windows file names through the Unix locale, and under the
 # default C locale every non-ASCII name (i.e. every Chinese download) fails to be created.
 # No Mono/Gecko: whenever wineboot updates the prefix (any rebuilt Wine) it offers to install
@@ -63,7 +62,6 @@ ENV PATH=/opt/wine/bin:$PATH \
     WINEDEBUG=-all \
     WINEDLLOVERRIDES="mscoree,mshtml=" \
     DISPLAY=:99
-USER ima
 VOLUME /data
 # 8765: MCP (streamable HTTP, /mcp) for agents; 9223: raw CDP, for debugging only
 EXPOSE 8765 9223

@@ -1,0 +1,18 @@
+services:
+  ima:
+    image: ghcr.io/rqi14/ima-wine:latest
+    container_name: ima
+    restart: unless-stopped
+    mem_limit: 2500m
+    shm_size: 512m
+    # ima rotates its login token on every start and writes it lazily: let it close cleanly,
+    # or the next start asks for the QR code again
+    stop_grace_period: 40s
+    ports:
+      - "127.0.0.1:8765:8765"     # MCP endpoint: http://127.0.0.1:8765/mcp
+    environment:
+      TZ: Asia/Shanghai
+      # Path under which the agent sees ./data/downloads (only if you mount it into the agent too):
+      # IMA_DOWNLOADS_PUBLIC: /opt/data/ima-downloads
+    volumes:
+      - ./data:/data              # Wine prefix, the ima client, login state, downloaded documents

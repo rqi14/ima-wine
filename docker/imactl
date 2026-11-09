@@ -1,0 +1,7 @@
+#!/bin/sh
+# `docker exec ima imactl ...` runs as root by default; run as the client's user instead, so files
+# it creates in /data stay writable for ima.
+if [ "$(id -u)" = 0 ]; then
+    exec setpriv --reuid=ima --regid=ima --init-groups env HOME=/home/ima "$0" "$@"
+fi
+exec /opt/imactl/venv/bin/python /opt/imactl/imactl.py "$@"

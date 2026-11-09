@@ -68,7 +68,10 @@ def page(prefix, wait=0.0):
     while True:
         for t in targets():
             if t['type'] == 'page' and t['url'].startswith(prefix):
-                return Target(t['webSocketDebuggerUrl']), t
+                try:
+                    return Target(t['webSocketDebuggerUrl']), t
+                except websocket.WebSocketException:
+                    pass  # listed but already closing: look again
         if time.time() >= end:
             return None, None
         time.sleep(0.5)
@@ -173,8 +176,8 @@ def kb_page():
         t, _ = page(KB_PAGE, wait=15)
         if not t:
             raise ImaError('could not open the knowledge base view (logged in?)')
-        # let the default (personal) KB finish loading: a click during that load gets lost
-        _await_view(t, lambda v: bool(v['title']), 'knowledge base view', timeout=30)
+        # the default (personal) KB loads late and a click during that load gets lost
+        _wait(t, lambda v: bool(v['title']) and v['n'] > 0, 'first load', timeout=30)
     return t
 
 
@@ -182,70 +185,75 @@ def list_kbs():
     return _js_until(kb_page(), 'return kbs().map(k => k.name)', lambda v: v and all(v))
 
 
-SNAPSHOT = 'return JSON.stringify([crumbs(), items().slice(0, 5).map(i => i.title)])'
+# What the knowledge-base page shows. Navigation waits for a state, never for a fixed delay:
+# the page title is the open KB's full name, the breadcrumb ends with the open folder.
+VIEW = '''return {title: document.title, crumbs: crumbs(), n: items().length,
+    first: items().slice(0, 5).map(i => i.title),
+    searching: !!$$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0)}'''
+CLOSE_SEARCH = '''const ed = $$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0);
+    if (!ed) return false; let bar = ed; for (let i = 0; i < 4 && bar.parentElement; i++) bar = bar.parentElement;
+    const c = [...bar.querySelectorAll('.icon-filled-close')].find(e => e.offsetWidth > 0); if (c) c.click(); return !!c'''
 
 
-def _await_change(t, before, timeout=4):
-    """After a click the old rows stay on screen for a moment: reading them then would list the
-    previous folder. Wait until the view differs from what it was before the click.
-    ponytail: no change within 4s = we clicked where we already were (new rows took <2s in
-    tests); the sidebar has no selected-state marker to check instead."""
-    end = time.time() + timeout
-    while time.time() < end:
-        time.sleep(0.5)
-        now = _js(t, SNAPSHOT)
-        if now != before and json.loads(now)[1]:
-            return
-    # same content is possible (clicked the folder already shown); fall through
+def _view(t):
+    return _js(t, VIEW)
 
 
-def _await_view(t, ok, what, timeout=20):
-    """Wait until the view is the one we asked for, judged by identity rather than by 'something
-    changed': on the first load the default (personal) knowledge base renders late, after our
-    click, and change-detection then happily returned the personal KB's rows."""
-    end = time.time() + timeout
+def _wait(t, ok, what, timeout=10):
+    """Poll until ok(view) holds on two reads in a row (rows render in steps; one read can catch
+    the old folder's rows under the new title)."""
+    end, last = time.time() + timeout, None
     while True:
-        v = _js(t, 'return {title: document.title, crumbs: crumbs(), n: items().length}')
-        if ok(v) and v['n']:
-            return
+        v = _view(t)
+        if ok(v) and v == last:
+            return v
         if time.time() >= end:
             if ok(v):
-                return  # the right view, just empty
-            raise ImaError(f'{what} did not open within {timeout}s')
-        time.sleep(0.5)
+                return v
+            raise ImaError(f'{what}: the knowledge base view did not get there within {timeout}s')
+        last = v
+        time.sleep(0.2)
 
 
-def open_kb(name):
+def open_kb(name, root=True):
+    """Show knowledge base `name`; root=True also leaves search results and subfolders. Clicks
+    nothing when it is already there: clicking the open KB is no reset (inside search results it
+    does nothing at all) and only cost a wait."""
     t = kb_page()
     list_kbs()
-    before = _js(t, SNAPSHOT)
-    click = f'const k = pick(kbs(), "name", {json.dumps(name)}); if (!k) return null; k.el.click(); return k.name'
-    for attempt in range(3):
-        r = _js(t, click)
-        if not r:
-            raise ImaError(f'no knowledge base matching {name!r}; have: {list_kbs()}')
-        try:  # the page title is the open knowledge base's full name
-            _await_view(t, lambda v: v['title'] == r, f'knowledge base {r!r}', timeout=8)
-            break
-        except ImaError:
-            if attempt == 2:
-                raise
-    _await_change(t, before)  # clicking the open KB resets it to its root: let that land
+    r = _js(t, f'const k = pick(kbs(), "name", {json.dumps(name)}); return k ? k.name : null')
+    if not r:
+        raise ImaError(f'no knowledge base matching {name!r}; have: {list_kbs()}')
+    if _view(t)['title'] != r:
+        for attempt in range(3):  # a click while the page loads can get lost
+            _js(t, f'pick(kbs(), "name", {json.dumps(r)}).el.click(); return 1')
+            try:
+                _wait(t, lambda v: v['title'] == r and v['n'] > 0, f'knowledge base {r!r}', timeout=8)
+                break
+            except ImaError:
+                if attempt == 2:
+                    raise
+    if root:
+        if _view(t)['searching'] and _js(t, CLOSE_SEARCH):
+            _wait(t, lambda v: not v['searching'], 'leaving the search results', timeout=5)
+        if len(_view(t)['crumbs']) > 1:  # in a subfolder: the first breadcrumb is the KB root
+            _js(t, 'const l = $$("nav.ant-breadcrumb li")[0].querySelector("a,span"); l.click(); return 1')
+            _wait(t, lambda v: len(v['crumbs']) <= 1, 'knowledge base root', timeout=8)
     return r
 
 
 def ls():
-    # an empty folder just waits out the timeout
-    r = _js_until(kb_page(), 'return {path: crumbs(), items: items().map(i => ({type: i.folder ? "folder" : "document", title: i.title, meta: i.meta}))}',
-                  lambda v: v['items'] and all(i['title'] for i in v['items']), timeout=10)
+    t = kb_page()
+    _wait(t, lambda v: all(v['first']), 'listing', timeout=5)  # titles fill in after the rows
+    r = _js(t, 'return {path: crumbs(), items: items().map(i => ({type: i.folder ? "folder" : "document", title: i.title, meta: i.meta}))}')
     return {'path': [p for p in r['path'] if p], 'items': r['items']}
 
 
 def cd(name):
     t = kb_page()
-    ls()  # wait for the rows to render
-    before = _js(t, SNAPSHOT)
+    ls()
     if name == '..':
+        depth = len(_view(t)['crumbs'])
         r = _js(t, 'const c = $$("nav.ant-breadcrumb li"); if (c.length < 2) return null; '
                    'const l = c[c.length-2].querySelector("a,span"); l.click(); return txt(l)')
     else:
@@ -254,9 +262,9 @@ def cd(name):
     if not r:
         raise ImaError(f'no folder {name!r} here; items: {[i["title"] for i in ls()["items"]]}')
     if name == '..':
-        _await_change(t, before)
-    else:  # the breadcrumb's last entry is the open folder
-        _await_view(t, lambda v: v['crumbs'] and v['crumbs'][-1] == r, f'folder {r!r}')
+        _wait(t, lambda v: len(v['crumbs']) < depth, f'folder {r!r}')
+    else:
+        _wait(t, lambda v: bool(v['crumbs']) and v['crumbs'][-1] == r, f'folder {r!r}')
     return r
 
 
@@ -265,7 +273,7 @@ def ask(kb, question, timeout=300):
     made files not viewable (文件被设为不可查看). Returns {answer, sources}; the answer is ima's
     model summarising the library, not the original text."""
     with LOCK:
-        open_kb(kb)
+        open_kb(kb, root=False)  # the Q&A box is there in every view
         t = kb_page()
         bubbles = 'return $$(\'[class*="_normalModeAiBubbleWrapper_"]\').filter(x => x.offsetWidth > 0)'
         n0 = len(_js(t, bubbles + '.map(x => 1)'))
@@ -300,21 +308,24 @@ def goto(kb, path=()):
 def search(kb, query):
     """The knowledge base's own full-text search (the magnifier next to 内容). Leaves the view on
     the results, so open_doc() can click one. Returns [{title, snippet}], one per document."""
-    open_kb(kb)
+    open_kb(kb, root=False)
     t = kb_page()
-    before = _js(t, SNAPSHOT)
-    ok = _js(t, '''const ed = () => $$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0);
-        if (!ed()) { const b = $$('.icon-search-normal[class*="_titleIcon_"]').find(e => e.offsetParent); if (b) b.click(); }
-        return true''')
-    time.sleep(1)
-    ok = _js(t, '''const e = $$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0);
-        if (!e) return false; e.focus(); document.execCommand('selectAll'); document.execCommand('delete'); return true''')
-    if not ok:
+    if not _view(t)['searching']:
+        _js(t, "const b = $$('.icon-search-normal[class*=\"_titleIcon_\"]').find(e => e.offsetParent); if (b) b.click(); return !!b")
+        _wait(t, lambda v: v['searching'], 'opening the search box', timeout=5)
+    before = _view(t)
+    if not _js(t, '''const e = $$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0);
+            if (!e) return false; e.focus(); document.execCommand('selectAll'); document.execCommand('delete'); return true'''):
         raise ImaError('knowledge base search box not found')
     t.call('Input.insertText', text=query)
     for typ in ('keyDown', 'keyUp'):
         t.call('Input.dispatchKeyEvent', type=typ, key='Enter', code='Enter', windowsVirtualKeyCode=13)
-    _await_change(t, before, timeout=15)
+    # the search API answers in ~0.3 s; wait for the rows to change and settle. Identical results
+    # (the same query twice) never change, so that case ends on the 4 s timeout.
+    try:
+        _wait(t, lambda v: v['first'] != before['first'] or v['n'] != before['n'], 'search results', timeout=4)
+    except ImaError:
+        pass
     seen, out = set(), []
     for i in ls()['items']:
         if i['type'] == 'document' and i['title'] not in seen:
