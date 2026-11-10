@@ -3,7 +3,7 @@
 在 Docker 里运行腾讯 [ima](https://ima.qq.com) 桌面客户端（Windows 版，跑在 Wine 上），通过 MCP 让 AI agent
 搜索、阅读你账号下的 ima 知识库，包括**订阅知识库**——它们的原文网页版和 OpenAPI 都读不到。
 
-- 列出 / 浏览 / 全文检索个人、共享、订阅知识库
+- 列出 / 浏览 / 全文检索个人、共享、订阅知识库；凭分享链接订阅新知识库
 - 取文档全文（按页分隔）和 PDF 原件，可直接共享给 agent 的容器
 - 调用知识库自带的 AI 问答
 - 微信扫码登录；掉线时工具直接返回二维码
@@ -56,9 +56,10 @@ mcp_servers:
 
 | 工具 | 作用 |
 |---|---|
-| `ima_list_knowledge_bases` | 所有知识库：个人、共享、订阅 |
+| `ima_list_knowledge_bases` | 所有知识库：个人、共享、订阅（实时，别处刚订阅的也在） |
+| `ima_subscribe(link)` | 凭分享链接（`https://ima.qq.com/wiki/?shareId=…`）订阅知识库；需库主审核的返回「待审核」，付费库不处理 |
 | `ima_list(kb, folders)` | 某个库或文件夹里的条目 |
-| `ima_search(kb, query)` | 库内全文检索，返回标题与命中片段 |
+| `ima_search(kb, query, limit)` | 库内全文检索，返回标题与命中片段 |
 | `ima_get_document(kb, title, pages, max_chars)` | 文档全文，按页分隔；超长时分段返回 |
 | `ima_render_pages(title, pages)` | 指定页的图片，用于图表、扫描件 |
 | `ima_ask(kb, question)` | 知识库自带的 AI 问答 |
@@ -113,17 +114,19 @@ echo scan-time > /sys/kernel/mm/ksm/advisor_mode    # 内核 ≥ 6.8：自动调
   被整片写入（移植自 [WineHQ bug 58805](https://bugs.winehq.org/show_bug.cgi?id=58805)）。另修了一个
   `shell32` 在文件移动失败时的崩溃。
 - **客户端**：ima 只在容器首次启动时下载，镜像里不包含它。客户端用 ima 自带的 `TencentRemoteDebugSwitch`
-  开启调试端口，`imactl` 通过 Chrome DevTools 协议像用户一样操作界面：打开知识库、搜索、点开文档、
-  按阅读器的「下载」按钮。
+  开启调试端口，`imactl` 通过 Chrome DevTools 协议驱动它。列库、浏览、搜索、订阅、打开文档调用的是客户端知识库
+  页面自己的服务（页面上按钮背后的同一批请求，由页面用自己的登录态发出），不点界面、不等渲染；取原文仍是在客户端
+  阅读器里按「下载」。知识库问答（`ima_ask`）还是在界面上输入问题、读回答。
 - **文字层**：下载后用 `pdftotext` 提取全文。思源黑体 / 宋体子集的 ToUnicode 常常损坏，按 Adobe 各发布版本的
   CID 表修复（`imactl/cidmaps`，由 `tools/build_cidmaps.py` 生成），修复直接写回 PDF。
 
 ## 已知限制
 
 - 库主设为「不可查看」的文件取不到原件，`ima_get_document` 会说明原因，可改用 `ima_ask`。
-- 有些 PDF 的正文被栅格化成图片（常见于 Aspose 由 Office 转出的文件），没有文字层。这些页会标在
+- 扫描件，以及正文被栅格化成图片的 PDF（常见于 Aspose 由 Office 转出的文件），没有可用的文字层。这些页会标在
   `image_only_pages` 里，可用 `ima_render_pages` 交给视觉模型；结构树里若有替代文本会一并返回。
-- 客户端只有一个界面，所有操作串行执行。
+- 所有操作串行执行。
+- 依赖 ima 页面内部的服务名（如 `READER_SERVICE`），升级 ima 版本后可能要跟着改。
 - 只支持 x86_64。
 
 ## 从源码构建

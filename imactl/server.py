@@ -28,8 +28,9 @@ mcp = FastMCP('ima', host=os.environ.get('IMA_MCP_HOST', '0.0.0.0'), port=int(os
                   'Tencent ima knowledge bases (personal, shared and subscribed), read through the official '
                   'desktop client. Find documents with ima_search (full text, per knowledge base) or browse with '
                   'ima_list_knowledge_bases / ima_list; read with ima_get_document (full text, page-separated; '
-                  'no folder path needed). If a tool says the client is logged out, send the QR image it '
-                  'returns to the user to scan with WeChat, then call ima_login_wait.'))
+                  'no folder path needed). ima_subscribe adds a knowledge base from a share link. If a tool '
+                  'says the client is logged out, send the QR image it returns to the user to scan with WeChat, '
+                  'then call ima_login_wait.'))
 
 
 async def run(fn, *args):
@@ -85,25 +86,34 @@ async def ima_login_wait(seconds: int = 180) -> str:
 # ---------- browsing ----------
 @mcp.tool()
 async def ima_list_knowledge_bases():
-    """Names of all knowledge bases in the sidebar: personal, shared with the user, and subscribed."""
-    return await guarded(lambda: json.dumps(ima.list_kbs(), ensure_ascii=False))
+    """All knowledge bases of the account: [{name, type: personal|shared|subscribed}]. Always current,
+    including ones subscribed elsewhere a moment ago."""
+    return await guarded(lambda: json.dumps([{'name': k['name'], 'type': k['type']} for k in ima.kbs()],
+                                            ensure_ascii=False))
+
+
+@mcp.tool()
+async def ima_subscribe(link: str):
+    """Subscribe to a knowledge base from its share link (https://ima.qq.com/wiki/?shareId=...) or
+    share id. Some owners approve subscribers by hand: the result then says it is pending. Paid
+    knowledge bases are refused; the user subscribes to those in the ima app."""
+    return await guarded(lambda: json.dumps(ima.subscribe(link), ensure_ascii=False))
 
 
 @mcp.tool()
 async def ima_list(kb: str, folders: list[str] | None = None):
     """Items of a knowledge base, or of a folder inside it (folders = path from the root).
-    Names may be given as a unique prefix. Returns [{type: folder|document, title, meta}]."""
-    def go():
-        ima.goto(kb, folders or [])
-        return json.dumps(ima.ls(), ensure_ascii=False)
-    return await guarded(go)
+    Names may be given as a unique prefix. Returns {path, items: [{type: folder|document, title, ...}],
+    more}; more = true when the folder has over 500 entries (use ima_search then)."""
+    return await guarded(lambda: json.dumps(ima.ls(kb, folders or []), ensure_ascii=False))
 
 
 @mcp.tool()
-async def ima_search(kb: str, query: str):
+async def ima_search(kb: str, query: str, limit: int = 20):
     """Full-text search inside one knowledge base (the client's own search, so it also covers
-    subscribed and shared libraries). Returns [{title, snippet}]; pass a title to ima_get_document."""
-    return await guarded(lambda: json.dumps(ima.search(kb, query), ensure_ascii=False))
+    subscribed and shared libraries). Returns up to `limit` (max 100) [{title, snippet}], best first;
+    pass a title to ima_get_document."""
+    return await guarded(lambda: json.dumps(ima.search(kb, query, min(limit, 100)), ensure_ascii=False))
 
 
 @mcp.tool()
@@ -158,7 +168,7 @@ async def ima_get_document(kb: str, title: str, folders: list[str] | None = None
     by the knowledge base's search. pages: e.g. '1-20,35' (default all).
     Output stops at max_chars; the footer then says which page to continue from.
     The header gives `file`, the original PDF as you can open it yourself (tables, charts, your own
-    tools). Pages listed in image_only_pages have no usable text layer (text drawn as outlines):
+    tools). Pages listed in image_only_pages have their text only in images (scans, rasterised text):
     read them as images with ima_render_pages or from the file. Fetched once, then cached."""
     def go():
         doc = _load(kb, title, folders)
@@ -169,8 +179,8 @@ async def ima_get_document(kb: str, title: str, folders: list[str] | None = None
         alt = doc.get('alt', {})
         for n in wanted:
             if n in garbled:
-                body = ('[no usable text layer: the text on this page is rasterised into images; read it as '
-                        'an image (ima_render_pages, or the file itself)]')
+                body = ('[no usable text layer: this page\'s text is only in images (a scan, or rasterised text); '
+                        'read it as an image (ima_render_pages, or the file itself)]')
                 if alt.get(str(n)):
                     body += '\n[the PDF\'s accessibility text for this page (exact, may not cover all of it):]\n' \
                             + '\n'.join(alt[str(n)])

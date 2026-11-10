@@ -27,6 +27,7 @@ def main():
     sp.add_parser('kbs')
     p = sp.add_parser('ls'); p.add_argument('kb'); p.add_argument('folders', nargs='*')
     p = sp.add_parser('search'); p.add_argument('kb'); p.add_argument('query')
+    sp.add_parser('subscribe', help='share link or share id').add_argument('link')
     p = sp.add_parser('get', help='full text of a document (folders optional: found by search)')
     p.add_argument('kb'); p.add_argument('path', nargs='+', help='folders..., title')
     a = ap.parse_args()
@@ -40,11 +41,14 @@ def main():
         elif a.cmd == 'close':
             ima.close()
         elif a.cmd == 'kbs':
-            out(ima.list_kbs())
+            for k in ima.kbs():
+                print(f"{k['type']:<11} {k['name']}")
+        elif a.cmd == 'subscribe':
+            out(ima.subscribe(a.link))
         elif a.cmd == 'ls':
-            ima.goto(a.kb, a.folders)
-            for i in ima.ls()['items']:
-                print(('F  ' if i['type'] == 'folder' else 'D  ') + i['title'] + f'    [{i["meta"]}]')
+            for i in ima.ls(a.kb, a.folders)['items']:
+                print(f"F  {i['title']}    [{i['items']}]" if i['type'] == 'folder' else
+                      f"D  {i['title']}    [{i['kind']}, {i['updated']}]")
         elif a.cmd == 'search':
             for r in ima.search(a.kb, a.query):
                 print(f"{r['title']}    [{r['snippet']}]")

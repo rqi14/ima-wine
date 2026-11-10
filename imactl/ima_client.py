@@ -1,10 +1,11 @@
-"""Drive the ima.copilot desktop client (under Wine) over CDP, the way a user would.
+"""Drive the ima.copilot desktop client (under Wine) over CDP.
 
-Boundary: only UI actions a user can take - clicking items, pressing the viewer's own 下载
-button, reading what the viewer renders. Nothing here calls ima's crypto bridge or fetches
-protected URLs; a document the client does not offer for download is read off the viewer.
+Boundary: only what the client itself does for its user - its knowledge-base page's own services
+(the calls behind its buttons, made by the page with its own login), pressing the viewer's 下载
+button, reading what the viewer renders. Nothing here calls ima's crypto bridge or fetches file
+URLs itself; a document the client does not offer for download is read off the viewer.
 """
-import base64, json, os, re, subprocess, threading, time, urllib.request
+import base64, json, os, re, subprocess, threading, time, urllib.parse, urllib.request
 from collections import Counter
 
 import websocket
@@ -95,7 +96,6 @@ const kbs = () => $$('[class*="_knowledgeListItem_"]').map(e => {
     const t = e.querySelector('[class*="_knowledgeListItemTitle_"]');
     return {el: e, name: t ? txt(t) : txt(e)};
 });
-const crumbs = () => $$('nav.ant-breadcrumb li').map(txt);
 const pick = (list, key, want) => list.find(x => x[key] === want) || list.find(x => x[key].startsWith(want))
                                   || list.find(x => x[key].includes(want));
 """
@@ -168,7 +168,27 @@ def close():
     browser().ws.send(json.dumps({'id': 1, 'method': 'Browser.close'}))
 
 
-# ---------- knowledge bases ----------
+# ---------- knowledge bases: the page's own services ----------
+# The knowledge-base page is a React app whose HTTP services live in an inversify container,
+# bound to Symbol.for(name). Calling them is what the page's own buttons do - same requests, same
+# login headers, same token refresh - without clicking and waiting for rows to render.
+SVC = r'''const svc = name => {
+    if (!window.__imaDI) {
+        const root = document.getElementById('root'), seen = new Set();
+        const stack = [root && root[Object.keys(root).find(k => k.startsWith('__reactContainer'))]];
+        while (stack.length && !window.__imaDI) {
+            const f = stack.pop(); if (!f || seen.has(f)) continue; seen.add(f);
+            const v = f.memoizedProps && f.memoizedProps.value;
+            if (v && v._bindingDictionary && typeof v.get === 'function') window.__imaDI = v;
+            if (f.child) stack.push(f.child); if (f.sibling) stack.push(f.sibling);
+        }
+        if (!window.__imaDI) throw new Error('the knowledge base page services were not found (another ima version?)');
+    }
+    return window.__imaDI.get(Symbol.for(name)) };
+'''
+KB_TYPES = {1001: 'personal', 1002: 'shared', 1003: 'subscribed', 1004: 'subscribed'}
+
+
 def kb_page():
     t, _ = page(KB_PAGE)
     if not t:
@@ -181,18 +201,174 @@ def kb_page():
     return t
 
 
-def list_kbs():
-    return _js_until(kb_page(), 'return kbs().map(k => k.name)', lambda v: v and all(v))
+def api(service, method, *args, what=None):
+    """await svc(service)[method](*args) in the knowledge-base page; service may name a member,
+    'OPEN_KNOWLEDGE_SERVICE.fileManagerHttpService'. The services return their error object (or
+    null) instead of throwing: turn that into ImaError."""
+    r = kb_page().js(f'''(async () => {{ {SVC}
+        let o = null; for (const [i, p] of {json.dumps(service.split('.'))}.entries()) o = i ? o[p] : svc(p);
+        const r = await o[{json.dumps(method)}](...{json.dumps(args)});
+        return r === undefined ? {{}} : r instanceof Error ? {{error: r.message || String(r)}} : r }})()''')
+    if r is None or (isinstance(r, dict) and ('error' in r or r.get('code') not in (None, 0))):
+        msg = (r or {}).get('error') or (r or {}).get('msg') or 'no answer'
+        raise ImaError(f'{what or method}: ima says "{msg}"')
+    return r
 
 
-# What the knowledge-base page shows. Navigation waits for a state, never for a fixed delay:
-# the page title is the open KB's full name, the breadcrumb ends with the open folder.
-VIEW = '''return {title: document.title, crumbs: crumbs(), n: items().length,
-    first: items().slice(0, 5).map(i => i.title),
-    searching: !!$$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0)}'''
-CLOSE_SEARCH = '''const ed = $$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0);
-    if (!ed) return false; let bar = ed; for (let i = 0; i < 4 && bar.parentElement; i++) bar = bar.parentElement;
-    const c = [...bar.querySelectorAll('.icon-filled-close')].find(e => e.offsetWidth > 0); if (c) c.click(); return !!c'''
+def _pick(items, key, want):
+    """Exact, then prefix, then substring match - tools accept names given as a prefix."""
+    for ok in (lambda v: v == want, lambda v: v.startswith(want), lambda v: want in v):
+        for x in items:
+            if ok(x[key]):
+                return x
+
+
+def kbs():
+    """[{id, name, type}] of all knowledge bases, asked from ima's server each time: a knowledge base
+    subscribed on the phone shows up at once (the page's sidebar only loads on start).
+    ponytail: first 50 per group (personal / shared / subscribed); page on nextCursor if anyone has more."""
+    r = api('READER_SERVICE', 'getKnowledgeBaseList',
+            {'params': [{'type': t, 'cursor': '', 'limit': 50} for t in KB_TYPES]}, what='knowledge base list')
+    return [{'id': k['id'], 'name': k['basicInfo']['name'], 'type': KB_TYPES[g['type']]}
+            for g in r['results'] for k in g.get('knowledgeBaseList') or []]
+
+
+def kb(name):
+    ks = kbs()
+    k = _pick(ks, 'name', name) or next((k for k in ks if k['id'] == name), None)
+    if not k:
+        raise ImaError(f'no knowledge base matching {name!r}; have: {[k["name"] for k in ks]}')
+    return k
+
+
+def _list(kb_id, folder_id, limit=500):
+    """Raw entries of a folder (the KB root's folder id is the KB id), following the cursor."""
+    out, cursor = [], ''
+    while True:
+        r = api('READER_SERVICE', 'getKnowledgeList', {'knowledgeBaseId': kb_id, 'folderId': folder_id, 'cursor': cursor,
+                                                       'limit': 50, 'sortType': 9}, what='listing')
+        out += r.get('knowledgeList') or []
+        cursor = r.get('nextCursor')
+        if r.get('isEnd') or not cursor or len(out) >= limit:
+            return out, not r.get('isEnd')
+
+
+def _folder(k, folders, names=None):
+    """Folder id of the path `folders` (names or prefixes) inside knowledge base k; appends the
+    full folder names to `names`."""
+    fid = k['id']
+    for name in folders:
+        subs = [i for i in _list(k['id'], fid)[0] if i.get('folderInfo')]
+        f = _pick(subs, 'title', name)
+        if not f:
+            raise ImaError(f'no folder {name!r} here; folders: {[i["title"] for i in subs]}')
+        fid = f['folderInfo']['folderId']
+        if names is not None:
+            names.append(f['title'])
+    return fid
+
+
+def ls(kb_name, folders=()):
+    k, path = kb(kb_name), []
+    items, more = _list(k['id'], _folder(k, folders, path))
+    out = [{'type': 'folder', 'title': i['title'], 'items': int(i['folderInfo'].get('fileNumber') or 0)}
+           if i.get('folderInfo') else
+           {'type': 'document', 'title': i['title'], 'kind': (i.get('mediaTypeInfo') or {}).get('name'),
+            'updated': i.get('timeWording')} for i in items]
+    return {'path': [k['name'], *path], 'items': out, 'more': more}
+
+
+def _search(kb_id, query):
+    r = api('READER_SERVICE', 'searchKnowledge', {'query': query, 'knowledgeBaseId': kb_id, 'comparedKnowledgeBaseId': kb_id,
+                                                  'policy': 0, 'cursor': ''}, what='search')
+    return [{**x['knowledge'], 'snippet': x.get('highlightContent') or x['knowledge'].get('introduction') or ''}
+            for x in r.get('searchedKnowledgeList') or [] if not x['knowledge'].get('folderInfo')]
+
+
+def search(kb_name, query, limit=20):
+    """The knowledge base's own full-text search. Returns [{title, snippet}], best first."""
+    return [{'title': h['title'], 'snippet': re.sub(r'\s+', ' ', re.sub(r'</?em>', '', h['snippet'])).strip()[:300]}
+            for h in _search(kb(kb_name)['id'], query)[:limit]]
+
+
+def _media(k, title, folders):
+    """The entry for document `title`: from its folder when given, else found with the KB's search.
+    The search is semantic: a long query (the whole title) can rank the document out, so shorten it."""
+    if folders:
+        m = _pick([i for i in _list(k['id'], _folder(k, folders))[0] if not i.get('folderInfo')], 'title', title)
+    else:
+        m = next((m for q in dict.fromkeys((title, title[:12], title[:6]))
+                  for m in [_pick(_search(k['id'], q), 'title', title)] if m), None)
+    if not m:
+        raise ImaError(f'{title!r} not found in {k["name"]!r}; try ima_search with a shorter query')
+    return m
+
+
+class Restricted(ImaError):
+    """The knowledge base's owner does not let subscribers open this file (ima: 文件被设为不可查看)."""
+
+
+def open_doc(k, m):
+    """Open a document in ima's viewer, as clicking it does. Returns the viewer target. getMedia
+    first is the page's own check: it says whether the client will open the file at all."""
+    ref = {'knowledgeBaseId': k['id'], 'mediaId': m['mediaId']}
+    g = api('OPEN_KNOWLEDGE_SERVICE.fileManagerHttpService', 'getMedia', ref, what='opening')
+    if g.get('action') != 1:  # 1 Open; 2 Toast, 3 Abstract: ima shows a toast instead of the file
+        raise Restricted(f'{m["title"]}: ima says "{g.get("toastText") or "暂时无法查看具体内容"}" - the knowledge base '
+                         f'owner does not let subscribers open this file. ima_ask can still query the knowledge base about it.')
+    before = {x['id'] for x in targets()}
+    api('OPEN_KNOWLEDGE_SERVICE', 'openKnowledgeMedia', ref, what='opening')
+    end = time.time() + 30
+    while time.time() < end:
+        new = [x for x in targets() if x['id'] not in before and x['type'] == 'page']
+        if new:
+            return new[0]
+        time.sleep(0.3)
+    raise ImaError(f'{m["title"]}: no viewer appeared within 30s')
+
+
+def refresh():
+    """Reload the knowledge-base page. Its sidebar is loaded once; ask() clicks in it."""
+    t = kb_page()
+    t.js('window.__imaStale = 1; location.reload(); 1')
+    end = time.time() + 30
+    while time.time() < end:
+        time.sleep(0.5)
+        try:
+            if t.js('!window.__imaStale && document.readyState === "complete"'):
+                break
+        except ImaError:
+            pass  # mid-navigation
+    _wait(t, lambda v: bool(v['title']) and v['n'] > 0, 'reload', timeout=30)
+
+
+def subscribe(link):
+    """Subscribe to (join) a knowledge base from its share link, https://ima.qq.com/wiki/?shareId=...,
+    or the bare shareId: what its 订阅 / 加入 button does. Paid knowledge bases are refused."""
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(link.strip()).query)
+    share = (q.get('shareId') or [link.strip()])[0]
+    r = api('KNOWLEDGE_BASE_SHARE_SERVICE', 'getKnowledgeBaseInfoFromShareId', {'shareId': share},
+            what=f'looking up share id {share!r} (is the link complete?)')
+    info = r.get('knowledgeBaseInfo')
+    if not info:
+        raise ImaError(f'no knowledge base behind share id {share!r}')
+    name, user = info['basicInfo']['name'], info.get('userPermissionInfo') or {}
+    if user.get('roleType'):  # 0 = visitor
+        return {'name': name, 'status': 'already subscribed'}
+    if user.get('isInApplyList'):
+        return {'name': name, 'status': 'already applied, waiting for the owner to approve'}
+    if int((info.get('paymentInfo') or {}).get('defaultPrice') or 0):
+        raise ImaError(f'{name!r} is a paid knowledge base: subscribe to it in the ima app yourself')
+    j = api('SHARE_KNOWLEDGE_MEMBER', 'joinKnowledge', {
+        'knowledgeBaseId': info['id'], 'memberCount': int((info.get('memberInfo') or {}).get('memberCount') or 0) + 1,
+        'applyReason': '', 'inviteToken': (q.get('inviteToken') or [''])[0]}, what='subscribing')
+    refresh()
+    return {'name': name, 'status': 'applied, waiting for the owner to approve' if j.get('needReview') else 'subscribed'}
+
+
+# The UI is still driven for one thing, the knowledge base's AI Q&A box (ask): that answer streams
+# into the page. The page title is the open KB's full name.
+VIEW = 'return {title: document.title, n: items().length, first: items().slice(0, 5).map(i => i.title)}'
 
 
 def _view(t):
@@ -215,57 +391,25 @@ def _wait(t, ok, what, timeout=10):
         time.sleep(0.2)
 
 
-def open_kb(name, root=True):
-    """Show knowledge base `name`; root=True also leaves search results and subfolders. Clicks
-    nothing when it is already there: clicking the open KB is no reset (inside search results it
-    does nothing at all) and only cost a wait."""
+def open_kb(name):
+    """Show knowledge base `name` in the page. Clicks nothing when it is already open."""
+    full = kb(name)['name']
     t = kb_page()
-    list_kbs()
-    r = _js(t, f'const k = pick(kbs(), "name", {json.dumps(name)}); return k ? k.name : null')
-    if not r:
-        raise ImaError(f'no knowledge base matching {name!r}; have: {list_kbs()}')
-    if _view(t)['title'] != r:
+    sidebar = lambda: _js_until(t, 'return kbs().map(k => k.name)', lambda v: v and all(v))
+    if full not in sidebar():
+        refresh()  # subscribed after the page loaded
+        if full not in sidebar():
+            raise ImaError(f'{full!r} is not in the client\'s sidebar')
+    if _view(t)['title'] != full:
         for attempt in range(3):  # a click while the page loads can get lost
-            _js(t, f'pick(kbs(), "name", {json.dumps(r)}).el.click(); return 1')
+            _js(t, f'pick(kbs(), "name", {json.dumps(full)}).el.click(); return 1')
             try:
-                _wait(t, lambda v: v['title'] == r and v['n'] > 0, f'knowledge base {r!r}', timeout=8)
+                _wait(t, lambda v: v['title'] == full and v['n'] > 0, f'knowledge base {full!r}', timeout=8)
                 break
             except ImaError:
                 if attempt == 2:
                     raise
-    if root:
-        if _view(t)['searching'] and _js(t, CLOSE_SEARCH):
-            _wait(t, lambda v: not v['searching'], 'leaving the search results', timeout=5)
-        if len(_view(t)['crumbs']) > 1:  # in a subfolder: the first breadcrumb is the KB root
-            _js(t, 'const l = $$("nav.ant-breadcrumb li")[0].querySelector("a,span"); l.click(); return 1')
-            _wait(t, lambda v: len(v['crumbs']) <= 1, 'knowledge base root', timeout=8)
-    return r
-
-
-def ls():
-    t = kb_page()
-    _wait(t, lambda v: all(v['first']), 'listing', timeout=5)  # titles fill in after the rows
-    r = _js(t, 'return {path: crumbs(), items: items().map(i => ({type: i.folder ? "folder" : "document", title: i.title, meta: i.meta}))}')
-    return {'path': [p for p in r['path'] if p], 'items': r['items']}
-
-
-def cd(name):
-    t = kb_page()
-    ls()
-    if name == '..':
-        depth = len(_view(t)['crumbs'])
-        r = _js(t, 'const c = $$("nav.ant-breadcrumb li"); if (c.length < 2) return null; '
-                   'const l = c[c.length-2].querySelector("a,span"); l.click(); return txt(l)')
-    else:
-        r = _js(t, f'const i = pick(items().filter(x => x.folder), "title", {json.dumps(name)}); '
-                   'if (!i) return null; i.el.click(); return i.title')
-    if not r:
-        raise ImaError(f'no folder {name!r} here; items: {[i["title"] for i in ls()["items"]]}')
-    if name == '..':
-        _wait(t, lambda v: len(v['crumbs']) < depth, f'folder {r!r}')
-    else:
-        _wait(t, lambda v: bool(v['crumbs']) and v['crumbs'][-1] == r, f'folder {r!r}')
-    return r
+    return full
 
 
 def ask(kb, question, timeout=300):
@@ -273,7 +417,7 @@ def ask(kb, question, timeout=300):
     made files not viewable (文件被设为不可查看). Returns {answer, sources}; the answer is ima's
     model summarising the library, not the original text."""
     with LOCK:
-        open_kb(kb, root=False)  # the Q&A box is there in every view
+        open_kb(kb)  # the Q&A box is there in every view
         t = kb_page()
         bubbles = 'return $$(\'[class*="_normalModeAiBubbleWrapper_"]\').filter(x => x.offsetWidth > 0)'
         n0 = len(_js(t, bubbles + '.map(x => 1)'))
@@ -299,86 +443,7 @@ def ask(kb, question, timeout=300):
         return {'answer': last['text'].strip(), 'sources': list(dict.fromkeys(s for s in last['sources'] if s))}
 
 
-def goto(kb, path=()):
-    open_kb(kb)
-    for folder in path:
-        cd(folder)
-
-
-def search(kb, query):
-    """The knowledge base's own full-text search (the magnifier next to 内容). Leaves the view on
-    the results, so open_doc() can click one. Returns [{title, snippet}], one per document."""
-    open_kb(kb, root=False)
-    t = kb_page()
-    if not _view(t)['searching']:
-        _js(t, "const b = $$('.icon-search-normal[class*=\"_titleIcon_\"]').find(e => e.offsetParent); if (b) b.click(); return !!b")
-        _wait(t, lambda v: v['searching'], 'opening the search box', timeout=5)
-    before = _view(t)
-    if not _js(t, '''const e = $$('[contenteditable][data-placeholder="在知识库中搜索"]').find(x => x.offsetWidth > 0);
-            if (!e) return false; e.focus(); document.execCommand('selectAll'); document.execCommand('delete'); return true'''):
-        raise ImaError('knowledge base search box not found')
-    t.call('Input.insertText', text=query)
-    for typ in ('keyDown', 'keyUp'):
-        t.call('Input.dispatchKeyEvent', type=typ, key='Enter', code='Enter', windowsVirtualKeyCode=13)
-    # the search API answers in ~0.3 s; wait for the rows to change and settle. Identical results
-    # (the same query twice) never change, so that case ends on the 4 s timeout.
-    try:
-        _wait(t, lambda v: v['first'] != before['first'] or v['n'] != before['n'], 'search results', timeout=4)
-    except ImaError:
-        pass
-    seen, out = set(), []
-    for i in ls()['items']:
-        if i['type'] == 'document' and i['title'] not in seen:
-            seen.add(i['title'])
-            snippet = re.sub(r'\s*\S+\s+\S+$', '', i['meta'])  # drop the trailing "PDF 5/20"
-            out.append({'title': i['title'], 'snippet': snippet.replace('\\n', ' ').strip()})
-    return out
-
-
 # ---------- documents ----------
-def _viewer(wait):
-    end = time.time() + wait
-    while True:
-        for t in targets():
-            if t['type'] == 'page' and any(v in t['url'] for v in VIEWER_IDS):
-                return t
-        if time.time() >= end:
-            return None
-        time.sleep(0.5)
-
-
-class Restricted(ImaError):
-    """The knowledge base's owner does not let subscribers open this file (ima: 文件被设为不可查看)."""
-
-
-# toasts ima shows instead of opening a file; seen: 文件被设为不可查看
-TOAST_WATCH = '''window.__imaToasts = []; if (!window.__imaToastObs) { window.__imaToastObs = new MutationObserver(ms => {
-    for (const m of ms) for (const n of m.addedNodes) { const s = (n.innerText || n.textContent || '').trim();
-        if (s && s.length < 120) window.__imaToasts.push(s) } });
-    window.__imaToastObs.observe(document.body, {childList: true, subtree: true}) } 1'''
-
-
-def open_doc(title):
-    ls()  # wait for the rows to render
-    t = kb_page()
-    before = {x['id'] for x in targets()}
-    t.js(TOAST_WATCH)
-    r = _js(t, f'const i = pick(items().filter(x => !x.folder), "title", {json.dumps(title)}); '
-               'if (!i) return null; i.el.click(); return i.title')
-    if not r:
-        raise ImaError(f'no document {title!r} here; items: {[i["title"] for i in ls()["items"]]}')
-    end = time.time() + 30
-    while time.time() < end:
-        new = [x for x in targets() if x['id'] not in before and x['type'] == 'page']
-        if new:
-            return r, new[0]
-        toasts = [s for s in (t.js('window.__imaToasts') or []) if '不可查看' in s or '无权' in s or '没有权限' in s]
-        if toasts:
-            raise Restricted(f'{r}: ima says "{toasts[0]}" - the knowledge base owner does not let subscribers '
-                             f'open this file. ima_ask can still query the knowledge base about it.')
-        time.sleep(0.5)
-    raise ImaError(f'{r}: no viewer appeared within 30s')
-
 
 def _wait_viewer_ready(vt):
     # the toolbar exists before the document has loaded; clicks then do nothing
@@ -626,7 +691,10 @@ def looks_garbled(text):
     PDFs: every text run is rasterised (a 2x2 colour image with a text-shaped soft mask) under an
     invisible text layer of .notdef glyphs that a broken ToUnicode maps to one character. The words
     are not in the file except, sometimes, as /Alt text in the structure tree (struct_alt_text);
-    the rest has to be read as images."""
+    the rest has to be read as images. A page with no text at all is a scan (one JPEG per page)
+    or a blank page: also only readable as an image."""
+    if not text.strip():
+        return True
     chars = [c for c in text if not c.isspace() and not c.isascii()]
     if len(chars) < 15:  # covers short cover pages too
         return False
@@ -663,23 +731,12 @@ def parse_pages(spec, total):
     return [p for p in got if 1 <= p <= total]
 
 
-def find(kb, title):
-    """Leave the KB's search results showing `title`. The search is semantic: a long query (the
-    whole title) can rank the document out of the results, so shorten the query until it shows."""
-    for q in dict.fromkeys((title, title[:12], title[:6])):
-        if any(h['title'].startswith(title) or title.startswith(h['title']) for h in search(kb, q)):
-            return
-    raise ImaError(f'{title!r} not found by searching {kb!r}; try ima_search with a shorter query')
-
-
-def get_document(kb, title, path=(), keep_viewer=False):
+def get_document(kb_name, title, folders=(), keep_viewer=False):
     """Full text of a document. Downloads it through the viewer when offered, else reads the viewer."""
     with LOCK:
-        if path:
-            goto(kb, path)
-        else:  # titles from OpenAPI search come without a folder path: find it with the KB's search
-            find(kb, title)
-        name, viewer = open_doc(title)
+        k = kb(kb_name)
+        m = _media(k, title, folders)
+        viewer = open_doc(k, m)
         try:
             file = download(viewer)
             repaired, alt = [], {}
@@ -699,7 +756,7 @@ def get_document(kb, title, path=(), keep_viewer=False):
             if not keep_viewer:
                 close_target(viewer)  # a viewer costs ~250 MB
         return {
-            'title': name, 'source': source, 'file': file, 'pages': texts, 'repaired': repaired,
+            'title': m['title'], 'source': source, 'file': file, 'pages': texts, 'repaired': repaired,
             'alt': {str(k): v for k, v in alt.items()},
             'garbled_pages': [i + 1 for i, t in enumerate(texts) if looks_garbled(t)],
         }
@@ -709,6 +766,7 @@ if __name__ == '__main__':  # self-check of the pure helpers
     assert parse_pages('1-3,7,99', 10) == [1, 2, 3, 7]
     assert parse_pages('', 3) == [1, 2, 3]
     assert looks_garbled('机' * 50 + '的')
+    assert looks_garbled(' \n\n')  # a scanned page
     assert looks_garbled('2026年中国磁悬浮柔性输送系统研究报告' + '与' * 13)  # a garbled cover page
     assert not looks_garbled('目录 磁悬浮柔性输送系统产品概要 中国市场分析 本土重点企业分析')
     assert not looks_garbled('人形机器人关节模组市场规模预计在二零三零年达到数百亿元，主要驱动力来自产业链降本与应用落地。' * 2)
